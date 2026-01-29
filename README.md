@@ -15,11 +15,6 @@ It combines:
 - Node.js **18+** (https://nodejs.org/en)
 - npm (comes with Node)
 
-## Install
-
-```bash
-npm install
-```
 
 ## Run from terminal (step-by-step)
 
