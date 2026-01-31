@@ -20,6 +20,20 @@ npm run web
 ```
 Open: <http://localhost:3000>
 
+### Basic HTTP Auth (optional)
+If you set these env vars, the entire web UI + API will be protected with Basic Auth:
+- `BASIC_AUTH_USER`
+- `BASIC_AUTH_PASS`
+
+If either one is missing, auth is disabled.
+
+Example:
+```bash
+export BASIC_AUTH_USER="tista"
+export BASIC_AUTH_PASS="change-me"
+npm run web
+```
+
 ### Endpoints
 - Snapshot (single response):
   - `/api/snapshot?asset=btc|eth|xrp|sol`
