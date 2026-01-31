@@ -91,6 +91,72 @@ async function resolveCurrentBtc15mMarket(nowMs = Date.now()) {
   return picked;
 }
 
+function parsePriceToBeatFromText(market) {
+  const text = String(market?.question ?? market?.title ?? "");
+  if (!text) return null;
+  const m = text.match(/price\s*to\s*beat[^\d$]*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+  if (!m) return null;
+  const raw = m[1].replace(/,/g, "");
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function extractNumericFromMarket(market) {
+  const directKeys = [
+    "priceToBeat",
+    "price_to_beat",
+    "strikePrice",
+    "strike_price",
+    "strike",
+    "threshold",
+    "thresholdPrice",
+    "threshold_price",
+    "targetPrice",
+    "target_price",
+    "referencePrice",
+    "reference_price"
+  ];
+
+  for (const k of directKeys) {
+    const v = market?.[k];
+    const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
+    if (Number.isFinite(n)) return n;
+  }
+
+  const seen = new Set();
+  const stack = [{ obj: market, depth: 0 }];
+
+  while (stack.length) {
+    const { obj, depth } = stack.pop();
+    if (!obj || typeof obj !== "object") continue;
+    if (seen.has(obj) || depth > 6) continue;
+    seen.add(obj);
+
+    const entries = Array.isArray(obj) ? obj.entries() : Object.entries(obj);
+    for (const [key, value] of entries) {
+      const k = String(key).toLowerCase();
+      if (value && typeof value === "object") {
+        stack.push({ obj: value, depth: depth + 1 });
+        continue;
+      }
+
+      if (!/(price|strike|threshold|target|beat)/i.test(k)) continue;
+
+      const n = typeof value === "string" ? Number(value) : typeof value === "number" ? value : NaN;
+      if (!Number.isFinite(n)) continue;
+
+      // guardrail: BTC-ish range
+      if (n > 1000 && n < 2_000_000) return n;
+    }
+  }
+
+  return null;
+}
+
+function strikePriceFromMarket(market) {
+  return extractNumericFromMarket(market) ?? parsePriceToBeatFromText(market);
+}
+
 async function fetchPolymarketSnapshot(nowMs = Date.now()) {
   const market = await resolveCurrentBtc15mMarket(nowMs);
   if (!market) return { ok: false, reason: "market_not_found" };
@@ -171,6 +237,7 @@ async function fetchPolymarketSnapshot(nowMs = Date.now()) {
     ok: true,
     market,
     marketSlug: String(market?.slug ?? ""),
+    strikePrice: strikePriceFromMarket(market),
     prices,
     liquidity,
     spread,
@@ -337,6 +404,7 @@ export async function computeSnapshot({ state } = {}) {
     polymarket: {
       ok: poly.ok,
       marketSlug: poly.ok ? poly.marketSlug : null,
+      strikePrice: poly.ok ? poly.strikePrice : null,
       prices: { up: marketUp, down: marketDown },
       liquidity: poly.ok ? poly.liquidity : null,
       spread: poly.ok ? poly.spread : null

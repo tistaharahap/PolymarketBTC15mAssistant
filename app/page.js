@@ -206,6 +206,12 @@ export default function Page() {
 
             <div style={{ height: 12 }} />
 
+            <div className="kv"><div className="k">Strike price</div><div className="v mono">{fmtUsd(data?.polymarket?.strikePrice, 0)}</div></div>
+            <div className="kv"><div className="k">Price to beat</div><div className="v mono">{fmtUsd(data?.priceToBeat?.value, 0)}</div></div>
+            <div className="kv"><div className="k">Δ vs price to beat</div><div className="v mono">{(data?.prices?.chainlink !== null && data?.prices?.chainlink !== undefined && data?.priceToBeat?.value !== null && data?.priceToBeat?.value !== undefined) ? `${data.prices.chainlink - data.priceToBeat.value > 0 ? "+" : "-"}${fmtUsd(Math.abs(data.prices.chainlink - data.priceToBeat.value), 2)}` : "-"}</div></div>
+
+            <div style={{ height: 12 }} />
+
             <div className="kv"><div className="k">Chainlink BTC/USD</div><div className="v mono">{fmtUsd(data?.prices?.chainlink, 2)}</div></div>
             <div className="kv"><div className="k">Binance BTCUSDT</div><div className="v mono">{fmtUsd(data?.prices?.binance, 0)}</div></div>
             <div className="kv"><div className="k">Diff</div><div className="v mono">{data?.prices?.diffUsd !== null && data?.prices?.diffUsd !== undefined ? `${data.prices.diffUsd > 0 ? "+" : "-"}${fmtUsd(Math.abs(data.prices.diffUsd), 2)} (${(data?.prices?.diffPct ?? 0) > 0 ? "+" : "-"}${Math.abs(data?.prices?.diffPct ?? 0).toFixed(2)}%)` : "-"}</div></div>
