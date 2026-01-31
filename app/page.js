@@ -40,18 +40,49 @@ export default function Page() {
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
   const [auto, setAuto] = useState(true);
-  const [tick, setTick] = useState(0);
+  // streaming mode; no polling tick needed
   const abortRef = useRef(null);
 
   useEffect(() => {
-    let t = null;
-    if (auto) {
-      t = setInterval(() => setTick((x) => x + 1), 1000);
-    }
-    return () => t && clearInterval(t);
+    abortRef.current?.abort?.();
+
+    if (!auto) return;
+
+    const es = new EventSource("/api/stream");
+
+    es.addEventListener("snapshot", (evt) => {
+      try {
+        const j = JSON.parse(evt.data);
+        setData(j);
+        setErr(null);
+        setLoading(false);
+      } catch (e) {
+        setErr(e?.message ?? String(e));
+      }
+    });
+
+    es.addEventListener("error", (evt) => {
+      // Some browsers emit generic error events; route also may send {event:error}
+      if (evt?.data) {
+        try {
+          const j = JSON.parse(evt.data);
+          setErr(j?.error ?? "Stream error");
+        } catch {
+          setErr("Stream error");
+        }
+      } else {
+        setErr("Stream disconnected");
+      }
+      setLoading(false);
+    });
+
+    return () => {
+      es.close();
+    };
   }, [auto]);
 
   async function refresh() {
+    // manual refresh uses snapshot endpoint once
     abortRef.current?.abort?.();
     const ac = new AbortController();
     abortRef.current = ac;
@@ -72,9 +103,10 @@ export default function Page() {
   }
 
   useEffect(() => {
-    refresh();
+    // when auto is OFF, load once
+    if (!auto) refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick]);
+  }, [auto]);
 
   const pUp = data?.predict?.pUp ?? null;
   const pDown = data?.predict?.pDown ?? null;
