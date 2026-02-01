@@ -32,3 +32,4 @@
 - Copy `.env.example` to `.env` for local settings and never commit secrets.
 - `BASIC_AUTH_USER`/`BASIC_AUTH_PASS` enable Basic Auth; `/api/stream` is intentionally unauthenticated.
 - Trading utilities are off by default and require `TRADING_ENABLED=true` plus `POLY_PRIVATE_KEY`.
+- Server-side trading routes live under `app/api/trade/*` and execute with the server key; keep deployments local or behind Basic Auth.

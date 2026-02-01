@@ -51,6 +51,12 @@ npm run web
 ### Endpoints
 - Market metadata snapshot (lightweight):
   - `/api/snapshot?asset=btc|eth|xrp|sol`
+- Trading (requires `TRADING_ENABLED=true` and server-side key; protected by Basic Auth if enabled):
+  - `POST /api/trade/limit` (`tokenId`, `side`, `price`, `size`, optional `orderType`, `postOnly`, `tickSize` (`0.1|0.01|0.001|0.0001`), `negRisk` (`true|false`))
+  - `POST /api/trade/market` (`tokenId`, `side`, `amount`, optional `orderType`, `price`, `tickSize` (`0.1|0.01|0.001|0.0001`), `negRisk` (`true|false`))
+  - `POST /api/trade/cancel` (`orderId`)
+  - `GET /api/trade/order?orderId=...`
+  - `GET /api/trade/balance`
 
 ### Data flow (client-first)
 - **Binance candles + last price**
@@ -84,6 +90,14 @@ This repo includes optional trading utilities under:
 These functions are **NOT used automatically** by the web UI.
 They are gated behind:
 - `TRADING_ENABLED=true`
+
+Server-side API routes are available for local trading workflows:
+```bash
+curl -X POST http://localhost:3000/api/trade/limit \
+  -H "Content-Type: application/json" \
+  -d '{"tokenId":"123","side":"BUY","price":0.52,"size":10}'
+```
+These routes execute orders with the server’s configured key. Keep deployments local or behind Basic Auth.
 
 ### Environment variables
 - `TRADING_ENABLED` (default: false)

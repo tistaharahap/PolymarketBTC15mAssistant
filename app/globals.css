@@ -22,11 +22,7 @@ body{
   margin:0;
   font-family: var(--font-body);
   color:var(--text);
-  background:
-    radial-gradient(900px 500px at 20% 10%, rgba(89,215,255,.18), transparent 60%),
-    radial-gradient(900px 600px at 80% 15%, rgba(69,255,178,.14), transparent 55%),
-    radial-gradient(1200px 900px at 50% 100%, rgba(255,92,122,.10), transparent 60%),
-    linear-gradient(180deg, var(--bg0), var(--bg1));
+  background: var(--bg0);
 }
 
 a{color:inherit}
@@ -301,6 +297,28 @@ a{color:inherit}
   margin-top: 12px;
 }
 
+.chartBelowGrid{
+  margin-top: 16px;
+  display:grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap:16px;
+}
+
+.tradeConsole{
+  border: 1px solid rgba(27,42,68,.8);
+  border-radius: 14px;
+  padding: 14px;
+  background: rgba(7,8,11,.25);
+}
+
+.tradeConsoleHeader{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom: 10px;
+  gap:10px;
+}
+
 .infoTable{
   width: 100%;
   border-collapse: collapse;
@@ -352,4 +370,188 @@ a{color:inherit}
   color: #db504a;
   font-variant-numeric: tabular-nums;
   text-align: center;
+}
+
+.tradeControls{
+  display:flex;
+  gap:18px;
+  flex-wrap:wrap;
+  align-items:flex-end;
+}
+
+.tradeControl{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  min-width: 200px;
+}
+
+.tradeControlLabel{
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.stepper{
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+
+.stepperBtn{
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  border: 1px solid rgba(27,42,68,.9);
+  background: rgba(10,16,28,.55);
+  color: var(--text);
+  font-size: 16px;
+  cursor:pointer;
+}
+
+.stepperBtn:disabled{
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+.stepperValue{
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(27,42,68,.8);
+  background: rgba(7,8,11,.3);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.tradeInput{
+  border-radius: 10px;
+  border: 1px solid rgba(27,42,68,.8);
+  background: rgba(7,8,11,.3);
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+  min-width: 140px;
+}
+
+.shareButtons{
+  margin-top: 8px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+}
+
+.shareBtn{
+  border-radius: 999px;
+  border: 1px solid rgba(27,42,68,.8);
+  background: rgba(10,16,28,.55);
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor:pointer;
+}
+
+.shareBtn:disabled{
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+.tradeTableWrap{
+  margin-top: 14px;
+}
+
+.tradeTable{
+  width: 100%;
+  border-collapse: collapse;
+  background: rgba(7,8,11,.25);
+  border: 1px solid rgba(27,42,68,.8);
+  border-radius: 12px;
+  overflow: hidden;
+  font-size: 13px;
+}
+
+.tradeTable th,
+.tradeTable td{
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(27,42,68,.5);
+  text-align: left;
+}
+
+.tradeTable thead th{
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tradeTable tbody tr:last-child td{
+  border-bottom: none;
+}
+
+.tradePrice{
+  font-variant-numeric: tabular-nums;
+}
+
+.tradeActions{
+  margin-top: 14px;
+  display:flex;
+  align-items:center;
+  gap:12px;
+  flex-wrap:wrap;
+}
+
+.tradeHint{
+  color: var(--amber);
+  font-size: 12px;
+}
+
+.tradeMeta{
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+}
+
+.tradeStatus{
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(27,42,68,.8);
+  background: rgba(7,8,11,.35);
+  font-size: 12px;
+}
+
+.tradeStatus.success{
+  border-color: rgba(69,255,178,.35);
+  color: var(--green);
+}
+
+.tradeStatus.error{
+  border-color: rgba(255,92,122,.4);
+  color: #ff9fb3;
+}
+
+.tradeStatus.pending{
+  border-color: rgba(255,204,102,.4);
+  color: var(--amber);
+}
+
+.tradeStatusTitle{
+  font-weight: 600;
+}
+
+.tradeStatusBody{
+  margin-top: 6px;
+  color: var(--text);
+  display:flex;
+  gap:14px;
+  flex-wrap:wrap;
+}
+
+@media (max-width: 940px){
+  .chartBelowGrid{
+    grid-template-columns: 1fr;
+  }
 }

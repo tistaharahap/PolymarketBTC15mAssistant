@@ -44,6 +44,14 @@ function fmtPct(p, digits = 2) {
   return `${(Number(p) * 100).toFixed(digits)}%`;
 }
 
+function roundToCent(value) {
+  return Math.round(Number(value) * 100) / 100;
+}
+
+function roundDownToCent(value) {
+  return Math.floor(Number(value) * 100) / 100;
+}
+
 function fmtTimeLeft(mins) {
   if (mins === null || mins === undefined || !Number.isFinite(Number(mins))) return "-";
   const totalSeconds = Math.max(0, Math.floor(Number(mins) * 60));
@@ -301,6 +309,10 @@ function CandleChart({ candles, seriesData, asset, intervalLabel = "1m" }) {
 
 export default function Page() {
   const [activeAsset, setActiveAsset] = useState("btc");
+  const [hedgeOffsetCents, setHedgeOffsetCents] = useState(10);
+  const [hedgeSizeInput, setHedgeSizeInput] = useState("20");
+  const [tradeBusy, setTradeBusy] = useState(false);
+  const [tradeStatus, setTradeStatus] = useState(null);
 
   // market meta (from server /api/snapshot). No SSE.
   const [metaByAsset, setMetaByAsset] = useState({});
@@ -687,6 +699,141 @@ export default function Page() {
     [chartCandles]
   );
 
+  const hedgePlan = useMemo(() => {
+    const upBid = activeBbo?.up?.bid ?? null;
+    const downBid = activeBbo?.down?.bid ?? null;
+    const targetTotal = (100 - hedgeOffsetCents) / 100;
+
+    if (!Number.isFinite(upBid) || !Number.isFinite(downBid)) {
+      return {
+        ok: false,
+        reason: "Waiting for best bids",
+        upBid,
+        downBid,
+        targetTotal
+      };
+    }
+
+    const higherSide = downBid >= upBid ? "down" : "up";
+    const higherBid = higherSide === "down" ? downBid : upBid;
+    const higherPrice = roundToCent(higherBid);
+
+    const lowerRaw = targetTotal - higherPrice;
+    let lowerPrice = roundToCent(lowerRaw);
+    if (higherPrice + lowerPrice > targetTotal + 1e-6) {
+      lowerPrice = roundDownToCent(lowerRaw);
+    }
+
+    const upPrice = higherSide === "up" ? higherPrice : lowerPrice;
+    const downPrice = higherSide === "down" ? higherPrice : lowerPrice;
+    const sum = upPrice + downPrice;
+
+    if (!Number.isFinite(upPrice) || !Number.isFinite(downPrice)) {
+      return { ok: false, reason: "Invalid price calculation", upBid, downBid, targetTotal };
+    }
+
+    if (upPrice <= 0 || downPrice <= 0) {
+      return { ok: false, reason: "Offset too large for current bids", upBid, downBid, targetTotal };
+    }
+
+    return {
+      ok: true,
+      upBid,
+      downBid,
+      higherSide,
+      targetTotal,
+      upPrice,
+      downPrice,
+      sum
+    };
+  }, [activeBbo?.up?.bid, activeBbo?.down?.bid, hedgeOffsetCents]);
+
+  const hedgeSize = useMemo(() => {
+    const num = Number(hedgeSizeInput);
+    return Number.isFinite(num) ? num : null;
+  }, [hedgeSizeInput]);
+
+  function adjustHedgeSize(delta) {
+    setHedgeSizeInput((prev) => {
+      const current = Number(prev);
+      const base = Number.isFinite(current) ? current : 0;
+      const next = Math.max(0, base + delta);
+      return String(next);
+    });
+  }
+
+  const tradeDisabledReason = useMemo(() => {
+    if (!activeTokens?.upTokenId || !activeTokens?.downTokenId) return "Missing token IDs";
+    if (!hedgePlan.ok) return hedgePlan.reason;
+    if (!hedgeSize || hedgeSize <= 0) return "Enter a valid share size";
+    return "";
+  }, [activeTokens?.upTokenId, activeTokens?.downTokenId, hedgePlan, hedgeSize]);
+
+  const tradeBadge = useMemo(() => {
+    if (tradeBusy) return { label: "Submitting", dot: "amber" };
+    if (tradeDisabledReason) return { label: "Disabled", dot: "red" };
+    return { label: "Ready", dot: "green" };
+  }, [tradeBusy, tradeDisabledReason]);
+
+  async function submitHedgeOrders() {
+    if (tradeBusy || tradeDisabledReason) return;
+    setTradeBusy(true);
+    setTradeStatus({ type: "pending", message: "Submitting hedge orders…" });
+
+    const upTokenId = activeTokens?.upTokenId;
+    const downTokenId = activeTokens?.downTokenId;
+    if (!upTokenId || !downTokenId) {
+      setTradeBusy(false);
+      setTradeStatus({ type: "error", message: "Missing token IDs" });
+      return;
+    }
+
+    const payloads = hedgePlan.higherSide === "up"
+      ? [
+        { tokenId: upTokenId, price: hedgePlan.upPrice, side: "BUY" },
+        { tokenId: downTokenId, price: hedgePlan.downPrice, side: "BUY" }
+      ]
+      : [
+        { tokenId: downTokenId, price: hedgePlan.downPrice, side: "BUY" },
+        { tokenId: upTokenId, price: hedgePlan.upPrice, side: "BUY" }
+      ];
+
+    const results = {};
+
+    try {
+      for (const payload of payloads) {
+        const res = await fetch("/api/trade/limit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tokenId: payload.tokenId,
+            side: payload.side,
+            price: payload.price,
+            size: hedgeSize,
+            postOnly: true
+          })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data?.error || `Order failed (HTTP ${res.status})`);
+        results[payload.tokenId] = data;
+      }
+
+      setTradeStatus({
+        type: "success",
+        message: "Hedge orders submitted",
+        results
+      });
+    } catch (err) {
+      setTradeStatus({
+        type: "error",
+        message: err?.message ?? String(err),
+        results
+      });
+    } finally {
+      setTradeBusy(false);
+    }
+  }
+
   const derived = useMemo(() => {
     if (!candles || candles.length < 60) {
       return { ok: false, reason: "warming_up" };
@@ -863,31 +1010,136 @@ export default function Page() {
         </div>
         <div className="cardBody">
           <CandleChart candles={chartCandles} seriesData={delta.data} asset={activeAsset} intervalLabel="15m" />
-          <div className="infoTableWrap">
-            <table className="infoTable">
-              <thead>
-                <tr>
-                  <th colSpan={3}>Info Table</th>
-                </tr>
-                <tr>
-                  <th>Method</th>
-                  <th>Demand Strength</th>
-                  <th>Supply Strength</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>Current Candle</td>
-                  <td className="demand">{fmtPct(delta.currentRatio, 2)}</td>
-                  <td className="supply">{fmtPct(delta.currentRatio === null ? null : 1 - delta.currentRatio, 2)}</td>
-                </tr>
-                <tr>
-                  <td>Moving Average (EMA {DELTA_PERIOD})</td>
-                  <td className="demand">{fmtPct(delta.emaRatio, 2)}</td>
-                  <td className="supply">{fmtPct(delta.emaRatio === null ? null : 1 - delta.emaRatio, 2)}</td>
-                </tr>
-              </tbody>
-            </table>
+          <div className="chartBelowGrid">
+            <div className="infoTableWrap">
+              <table className="infoTable">
+                <thead>
+                  <tr>
+                    <th colSpan={3}>Info Table</th>
+                  </tr>
+                  <tr>
+                    <th>Method</th>
+                    <th>Demand Strength</th>
+                    <th>Supply Strength</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Current Candle</td>
+                    <td className="demand">{fmtPct(delta.currentRatio, 2)}</td>
+                    <td className="supply">{fmtPct(delta.currentRatio === null ? null : 1 - delta.currentRatio, 2)}</td>
+                  </tr>
+                  <tr>
+                    <td>Moving Average (EMA {DELTA_PERIOD})</td>
+                    <td className="demand">{fmtPct(delta.emaRatio, 2)}</td>
+                    <td className="supply">{fmtPct(delta.emaRatio === null ? null : 1 - delta.emaRatio, 2)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div className="tradeConsole">
+              <div className="tradeConsoleHeader">
+                <div className="cardTitle">Trade (Hedged)</div>
+                <div className="badge"><span className={dotClass(tradeBadge.dot)} />{tradeBadge.label}</div>
+              </div>
+
+              <div className="tradeControls">
+                <div className="tradeControl">
+                  <div className="tradeControlLabel">Offset</div>
+                  <div className="stepper">
+                    <button
+                      className="stepperBtn"
+                      onClick={() => setHedgeOffsetCents((v) => Math.max(1, v - 1))}
+                      disabled={tradeBusy || hedgeOffsetCents <= 1}
+                    >
+                      –
+                    </button>
+                    <div className="stepperValue mono">{hedgeOffsetCents}¢ under $1</div>
+                    <button
+                      className="stepperBtn"
+                      onClick={() => setHedgeOffsetCents((v) => Math.min(30, v + 1))}
+                      disabled={tradeBusy || hedgeOffsetCents >= 30}
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+                <div className="tradeControl">
+                  <div className="tradeControlLabel">Shares</div>
+                  <input
+                    className="tradeInput"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={hedgeSizeInput}
+                    onChange={(e) => setHedgeSizeInput(e.target.value)}
+                    disabled={tradeBusy}
+                  />
+                  <div className="shareButtons">
+                    {[-50, -20, -10, 10, 20, 50].map((delta) => (
+                      <button
+                        key={delta}
+                        className="shareBtn"
+                        onClick={() => adjustHedgeSize(delta)}
+                        disabled={tradeBusy}
+                      >
+                        {delta > 0 ? `+${delta}` : `${delta}`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="tradeTableWrap">
+                <table className="tradeTable">
+                  <thead>
+                    <tr>
+                      <th />
+                      <th>UP</th>
+                      <th>DOWN</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>Bid Price</td>
+                      <td className="tradePrice">{hedgePlan.ok ? fmtUsd(hedgePlan.upPrice, 2) : "-"}</td>
+                      <td className="tradePrice">{hedgePlan.ok ? fmtUsd(hedgePlan.downPrice, 2) : "-"}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div className="tradeMeta">
+                  <div>Best Bid: UP {fmtUsd(hedgePlan.upBid, 2)} · DOWN {fmtUsd(hedgePlan.downBid, 2)}</div>
+                  <div>Shares: {hedgeSize ? fmtNum(hedgeSize, 0) : "-"}</div>
+                  {hedgePlan.ok && hedgeSize ? (
+                    <div>
+                      Preview: BUY {fmtNum(hedgeSize, 0)} UP @ {fmtUsd(hedgePlan.upPrice, 2)} · BUY {fmtNum(hedgeSize, 0)} DOWN @ {fmtUsd(hedgePlan.downPrice, 2)} · Total {fmtUsd(hedgePlan.sum, 2)} (Target {fmtUsd(hedgePlan.targetTotal, 2)}) · Higher {hedgePlan.higherSide.toUpperCase()}
+                    </div>
+                  ) : (
+                    <div className="tradeHint">{tradeDisabledReason || "Preview unavailable"}</div>
+                  )}
+                </div>
+              </div>
+
+              <div className="tradeActions">
+                <button className="btn" onClick={submitHedgeOrders} disabled={tradeBusy || Boolean(tradeDisabledReason)}>
+                  Place Hedge Orders
+                </button>
+                {tradeDisabledReason ? <div className="tradeHint">{tradeDisabledReason}</div> : null}
+              </div>
+
+              {tradeStatus ? (
+                <div className={`tradeStatus ${tradeStatus.type}`}>
+                  <div className="tradeStatusTitle">{tradeStatus.message}</div>
+                  {tradeStatus.results && activeTokens?.upTokenId && activeTokens?.downTokenId ? (
+                    <div className="tradeStatusBody mono">
+                      <div>UP: {tradeStatus.results[activeTokens.upTokenId]?.orderId ?? "-"}</div>
+                      <div>DOWN: {tradeStatus.results[activeTokens.downTokenId]?.orderId ?? "-"}</div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           </div>
         </div>
       </section>
