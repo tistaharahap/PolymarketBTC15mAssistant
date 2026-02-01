@@ -801,7 +801,7 @@ export default function Page() {
     const results = {};
 
     try {
-      for (const payload of payloads) {
+      const requests = payloads.map(async (payload) => {
         const res = await fetch("/api/trade/limit", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -815,14 +815,64 @@ export default function Page() {
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data?.error || `Order failed (HTTP ${res.status})`);
-        results[payload.tokenId] = data;
+        return { tokenId: payload.tokenId, data };
+      });
+
+      const settled = await Promise.allSettled(requests);
+      const errors = [];
+      for (const outcome of settled) {
+        if (outcome.status === "fulfilled") {
+          results[outcome.value.tokenId] = outcome.value.data;
+        } else {
+          errors.push(outcome.reason);
+        }
       }
 
-      setTradeStatus({
-        type: "success",
-        message: "Hedge orders submitted",
-        results
-      });
+      if (errors.length) {
+        const message = errors[0]?.message ?? String(errors[0]);
+        const orderIds = Object.values(results)
+          .map((r) => r?.orderId)
+          .filter(Boolean);
+
+        if (orderIds.length) {
+          const cancelResults = await Promise.allSettled(orderIds.map(async (orderId) => {
+            const res = await fetch("/api/trade/cancel", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ orderId })
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              throw new Error(data?.error || `Cancel failed (HTTP ${res.status})`);
+            }
+            return orderId;
+          }));
+
+          const canceled = cancelResults.filter((r) => r.status === "fulfilled").length;
+          const cancelFailures = cancelResults.filter((r) => r.status === "rejected");
+          const cancelNote = cancelFailures.length
+            ? `Canceled ${canceled}/${orderIds.length} (some cancel failures)`
+            : `Canceled ${canceled}/${orderIds.length}`;
+
+          setTradeStatus({
+            type: "error",
+            message: `${message}. ${cancelNote}.`,
+            results
+          });
+        } else {
+          setTradeStatus({
+            type: "error",
+            message,
+            results
+          });
+        }
+      } else {
+        setTradeStatus({
+          type: "success",
+          message: "Hedge orders submitted",
+          results
+        });
+      }
     } catch (err) {
       setTradeStatus({
         type: "error",
