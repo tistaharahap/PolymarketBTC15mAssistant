@@ -31,6 +31,11 @@ async function initClobContext() {
   }
 
   const signer = new Wallet(config.privateKey);
+  // ethers v6 uses signTypedData; clob-client expects _signTypedData (v5).
+  if (typeof signer._signTypedData !== "function" && typeof signer.signTypedData === "function") {
+    signer._signTypedData = (domain, types, value) => signer.signTypedData(domain, types, value);
+    logger.info("Applied ethers v6 _signTypedData shim for clob-client");
+  }
   const funderAddress = config.funderAddress ? normalizeAddress(config.funderAddress) : signer.address;
   const signatureType = config.signatureType;
 
