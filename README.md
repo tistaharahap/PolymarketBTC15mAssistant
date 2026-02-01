@@ -52,6 +52,7 @@ npm run web
 - Market metadata snapshot (lightweight):
   - `/api/snapshot?asset=btc|eth|xrp|sol`
 - Trading (requires `TRADING_ENABLED=true` and server-side key; protected by Basic Auth if enabled):
+  - `GET /api/trade/init` (pre-derive L2 credentials on boot/page load)
   - `POST /api/trade/limit` (`tokenId`, `side`, `price`, `size`, optional `orderType`, `postOnly`, `tickSize` (`0.1|0.01|0.001|0.0001`), `negRisk` (`true|false`))
   - `POST /api/trade/market` (`tokenId`, `side`, `amount`, optional `orderType`, `price`, `tickSize` (`0.1|0.01|0.001|0.0001`), `negRisk` (`true|false`))
   - `POST /api/trade/cancel` (`orderId`)

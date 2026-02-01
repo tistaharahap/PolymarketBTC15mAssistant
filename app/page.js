@@ -314,6 +314,10 @@ export default function Page() {
   const [tradeBusy, setTradeBusy] = useState(false);
   const [tradeStatus, setTradeStatus] = useState(null);
 
+  useEffect(() => {
+    fetch("/api/trade/init").catch(() => {});
+  }, []);
+
   // market meta (from server /api/snapshot). No SSE.
   const [metaByAsset, setMetaByAsset] = useState({});
   const [metaErrByAsset, setMetaErrByAsset] = useState({});
