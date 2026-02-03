@@ -318,6 +318,7 @@ export default function Page() {
   const [autoDelaySec, setAutoDelaySec] = useState(30);
   const [autoConfirmOpen, setAutoConfirmOpen] = useState(false);
   const [autoStatus, setAutoStatus] = useState(null);
+  const [orderHistory, setOrderHistory] = useState([]);
 
   useEffect(() => {
     fetch("/api/trade/init").catch(() => {});
@@ -799,6 +800,13 @@ export default function Page() {
     }
   }
 
+  function addHistoryEntry(entry) {
+    setOrderHistory((prev) => {
+      const next = [entry, ...prev];
+      return next.slice(0, 50);
+    });
+  }
+
   async function submitHedgeOrders({ source = "manual" } = {}) {
     const reason = source === "auto" ? tradeDisabledReason : manualDisabledReason;
     if (tradeBusy || reason) {
@@ -815,6 +823,19 @@ export default function Page() {
     if (!upTokenId || !downTokenId) {
       setTradeBusy(false);
       setTradeStatus({ type: "error", message: "Missing token IDs" });
+      addHistoryEntry({
+        ts: Date.now(),
+        source,
+        status: "error",
+        asset: activeAsset,
+        upPrice: hedgePlan.upPrice,
+        downPrice: hedgePlan.downPrice,
+        size: hedgeSize,
+        target: hedgePlan.targetTotal,
+        sum: hedgePlan.sum,
+        higherSide: hedgePlan.higherSide,
+        error: "Missing token IDs"
+      });
       return;
     }
 
@@ -829,6 +850,17 @@ export default function Page() {
       ];
 
     const results = {};
+    const entryBase = {
+      ts: Date.now(),
+      source,
+      asset: activeAsset,
+      upPrice: hedgePlan.upPrice,
+      downPrice: hedgePlan.downPrice,
+      size: hedgeSize,
+      target: hedgePlan.targetTotal,
+      sum: hedgePlan.sum,
+      higherSide: hedgePlan.higherSide
+    };
 
     try {
       const requests = payloads.map(async (payload) => {
@@ -892,6 +924,12 @@ export default function Page() {
           if (source === "auto") {
             setAutoStatus({ type: "error", message: `${message}. ${cancelNote}.` });
           }
+          addHistoryEntry({
+            ...entryBase,
+            status: "error",
+            orderIds,
+            error: `${message}. ${cancelNote}.`
+          });
         } else {
           setTradeStatus({
             type: "error",
@@ -901,8 +939,15 @@ export default function Page() {
           if (source === "auto") {
             setAutoStatus({ type: "error", message });
           }
+          addHistoryEntry({
+            ...entryBase,
+            status: "error",
+            orderIds: [],
+            error: message
+          });
         }
       } else {
+        const orderIds = Object.values(results).map((r) => r?.orderId).filter(Boolean);
         setTradeStatus({
           type: "success",
           message: "Hedge orders submitted",
@@ -911,6 +956,11 @@ export default function Page() {
         if (source === "auto") {
           setAutoStatus({ type: "success", message: "Auto trade submitted" });
         }
+        addHistoryEntry({
+          ...entryBase,
+          status: "success",
+          orderIds
+        });
       }
     } catch (err) {
       setTradeStatus({
@@ -921,6 +971,12 @@ export default function Page() {
       if (source === "auto") {
         setAutoStatus({ type: "error", message: err?.message ?? String(err) });
       }
+      addHistoryEntry({
+        ...entryBase,
+        status: "error",
+        orderIds: Object.values(results).map((r) => r?.orderId).filter(Boolean),
+        error: err?.message ?? String(err)
+      });
     } finally {
       setTradeBusy(false);
     }
@@ -941,19 +997,25 @@ export default function Page() {
       return;
     }
 
-    const fireAt = startMs + autoDelaySec * 1000;
-    if (Date.now() > fireAt) {
-      setAutoStatus({ type: "error", message: "Auto window passed; no trades allowed" });
-      return;
-    }
-
-    if (autoLastTradeRef.current.slug && autoLastTradeRef.current.slug === activeMarketSlug) {
+    const windowMs = 15 * 60_000;
+    const windowEndMs = startMs + windowMs;
+    const alreadyFiredThisWindow = autoLastTradeRef.current.slug === activeMarketSlug && Date.now() < windowEndMs;
+    if (alreadyFiredThisWindow) {
       setAutoStatus({ type: "info", message: "Auto already fired for this window" });
       return;
     }
 
+    let fireAt = startMs + autoDelaySec * 1000;
+    if (Date.now() > fireAt) {
+      const windowsAhead = Math.floor((Date.now() - startMs) / windowMs) + 1;
+      const nextStart = startMs + windowsAhead * windowMs;
+      fireAt = nextStart + autoDelaySec * 1000;
+    }
+
     const delay = Math.max(0, fireAt - Date.now());
-    setAutoStatus({ type: "pending", message: `Auto trade scheduled for ${new Date(fireAt).toLocaleTimeString()}` });
+    const label = new Date(fireAt).toLocaleTimeString();
+    const nextWindowNote = Date.now() > (startMs + autoDelaySec * 1000) ? " (next window)" : "";
+    setAutoStatus({ type: "pending", message: `Auto trade scheduled for ${label}${nextWindowNote}` });
     autoTimerRef.current = setTimeout(async () => {
       if (!autoEnabled) return;
       autoLastTradeRef.current = { slug: activeMarketSlug ?? null };
@@ -1140,31 +1202,39 @@ export default function Page() {
         <div className="cardBody">
           <CandleChart candles={chartCandles} seriesData={delta.data} asset={activeAsset} intervalLabel="15m" />
           <div className="chartBelowGrid">
-            <div className="infoTableWrap">
-              <table className="infoTable">
-                <thead>
-                  <tr>
-                    <th colSpan={3}>Info Table</th>
-                  </tr>
-                  <tr>
-                    <th>Method</th>
-                    <th>Demand Strength</th>
-                    <th>Supply Strength</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>Current Candle</td>
-                    <td className="demand">{fmtPct(delta.currentRatio, 2)}</td>
-                    <td className="supply">{fmtPct(delta.currentRatio === null ? null : 1 - delta.currentRatio, 2)}</td>
-                  </tr>
-                  <tr>
-                    <td>Moving Average (EMA {DELTA_PERIOD})</td>
-                    <td className="demand">{fmtPct(delta.emaRatio, 2)}</td>
-                    <td className="supply">{fmtPct(delta.emaRatio === null ? null : 1 - delta.emaRatio, 2)}</td>
-                  </tr>
-                </tbody>
-              </table>
+            <div className="tradeHistory">
+              <div className="tradeHistoryHeader">
+                <div className="cardTitle">Order History</div>
+                <div className="tradeHistoryMeta mono">{orderHistory.length} entries</div>
+              </div>
+              {orderHistory.length ? (
+                <div className="tradeHistoryList">
+                  {orderHistory.map((entry, idx) => (
+                    <div key={`${entry.ts}-${idx}`} className={`tradeHistoryItem ${entry.status}`}>
+                      <div className="tradeHistoryRow">
+                        <span className="mono">{new Date(entry.ts).toLocaleTimeString()}</span>
+                        <span className="tradeHistoryTag">{entry.source?.toUpperCase() ?? "-"}</span>
+                        <span className="tradeHistoryTag">{entry.status?.toUpperCase() ?? "-"}</span>
+                      </div>
+                      <div className="tradeHistoryRow">
+                        <span>{entry.asset ? entry.asset.toUpperCase() : "-"} · {entry.size ? `${fmtNum(entry.size, 0)} sh` : "-"}</span>
+                        <span>UP {fmtUsd(entry.upPrice, 2)} · DOWN {fmtUsd(entry.downPrice, 2)}</span>
+                      </div>
+                      <div className="tradeHistoryRow">
+                        <span>Total {fmtUsd(entry.sum, 2)} (Target {fmtUsd(entry.target, 2)})</span>
+                      </div>
+                      {entry.orderIds?.length ? (
+                        <div className="tradeHistoryRow mono">Order IDs: {entry.orderIds.join(", ")}</div>
+                      ) : null}
+                      {entry.error ? (
+                        <div className="tradeHistoryRow error">{entry.error}</div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="tradeHistoryEmpty">No orders sent yet.</div>
+              )}
             </div>
 
             <div className="tradeConsole">

@@ -298,15 +298,87 @@ a{color:inherit}
   text-align:center;
 }
 
-.infoTableWrap{
-  margin-top: 12px;
-}
-
 .chartBelowGrid{
   margin-top: 16px;
   display:grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap:16px;
+}
+
+.tradeHistory{
+  border: 1px solid rgba(27,42,68,.8);
+  border-radius: 14px;
+  padding: 14px;
+  background: rgba(7,8,11,.25);
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+
+.tradeHistoryHeader{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+}
+
+.tradeHistoryMeta{
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.tradeHistoryList{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  max-height: 420px;
+  overflow:auto;
+}
+
+.tradeHistoryItem{
+  border: 1px solid rgba(27,42,68,.6);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(7,8,11,.35);
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.tradeHistoryItem.success{
+  border-color: rgba(69,255,178,.35);
+}
+
+.tradeHistoryItem.error{
+  border-color: rgba(255,92,122,.4);
+}
+
+.tradeHistoryRow{
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+}
+
+.tradeHistoryRow.error{
+  color: #ff9fb3;
+}
+
+.tradeHistoryTag{
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(27,42,68,.7);
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: .08em;
+}
+
+.tradeHistoryEmpty{
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 0;
 }
 
 .tradeConsole{
@@ -329,59 +401,6 @@ a{color:inherit}
   align-items:center;
   gap:10px;
   flex-wrap:wrap;
-}
-
-.infoTable{
-  width: 100%;
-  border-collapse: collapse;
-  background: rgba(13,26,63,.45);
-  border: 1px solid rgba(28,48,109,.8);
-  border-radius: 12px;
-  overflow: hidden;
-  font-size: 12px;
-}
-
-.infoTable th,
-.infoTable td{
-  padding: 8px 10px;
-  border-bottom: 1px solid rgba(28,48,109,.6);
-  text-align: left;
-}
-
-.infoTable thead th{
-  color: #ffffff;
-  font-weight: 600;
-}
-
-.infoTable thead tr:first-child th{
-  background: rgba(13,26,63,.75);
-  text-transform: uppercase;
-  letter-spacing: .1em;
-  font-size: 11px;
-  text-align: center;
-}
-
-.infoTable thead tr:last-child th{
-  background: rgba(13,26,63,.55);
-  color: var(--muted);
-  font-weight: 500;
-  text-align: center;
-}
-
-.infoTable tbody tr:last-child td{
-  border-bottom: none;
-}
-
-.infoTable .demand{
-  color: #56a3a6;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-}
-
-.infoTable .supply{
-  color: #db504a;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
 }
 
 .tradeControls{
