@@ -808,10 +808,27 @@ export default function Page() {
   }
 
   async function submitHedgeOrders({ source = "manual" } = {}) {
+    const entryBase = {
+      ts: Date.now(),
+      source,
+      asset: activeAsset,
+      upPrice: hedgePlan.upPrice,
+      downPrice: hedgePlan.downPrice,
+      size: hedgeSize,
+      target: hedgePlan.targetTotal,
+      sum: hedgePlan.sum,
+      higherSide: hedgePlan.higherSide
+    };
     const reason = source === "auto" ? tradeDisabledReason : manualDisabledReason;
     if (tradeBusy || reason) {
       if (source === "auto" && reason) {
         setAutoStatus({ type: "error", message: reason });
+        addHistoryEntry({
+          ...entryBase,
+          status: "skipped",
+          orderIds: [],
+          error: reason
+        });
       }
       return;
     }
@@ -850,17 +867,6 @@ export default function Page() {
       ];
 
     const results = {};
-    const entryBase = {
-      ts: Date.now(),
-      source,
-      asset: activeAsset,
-      upPrice: hedgePlan.upPrice,
-      downPrice: hedgePlan.downPrice,
-      size: hedgeSize,
-      target: hedgePlan.targetTotal,
-      sum: hedgePlan.sum,
-      higherSide: hedgePlan.higherSide
-    };
 
     try {
       const requests = payloads.map(async (payload) => {
@@ -926,7 +932,7 @@ export default function Page() {
           }
           addHistoryEntry({
             ...entryBase,
-            status: "error",
+            status: cancelFailures.length ? "error" : "canceled",
             orderIds,
             error: `${message}. ${cancelNote}.`
           });
