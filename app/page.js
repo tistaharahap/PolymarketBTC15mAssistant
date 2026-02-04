@@ -1003,7 +1003,8 @@ export default function Page() {
       note: note || `Hedge ${hedgeFilled ? "filled" : "attempted"} via taker limit`,
       filledLeg,
       hedgeLeg,
-      hedgeSize: filledSize
+      hedgeSize: filledSize,
+      hedgePrice: hedgeLimitPrice
     });
     return { ok: hedgeFilled, message };
   }
@@ -1620,7 +1621,7 @@ export default function Page() {
                       ) : null}
                       {entry.hedgeLeg ? (
                         <div className="tradeHistoryRow">
-                          Hedge: {entry.hedgeLeg} {entry.hedgeSize ? `${fmtNum(entry.hedgeSize, 0)} sh` : "-"} · Triggered by {entry.filledLeg ?? "-"}
+                          Hedge: {entry.hedgeLeg} {entry.hedgeSize ? `${fmtNum(entry.hedgeSize, 0)} sh` : "-"} @ {entry.hedgePrice ? fmtUsd(entry.hedgePrice, 2) : "-"} · Triggered by {entry.filledLeg ?? "-"}
                         </div>
                       ) : null}
                       {entry.note ? (
