@@ -901,7 +901,7 @@ export default function Page() {
     });
   }
 
-  async function hedgeWithFak({ filledTokenId, filledSize, orderIds, results, entryBase, source }) {
+  async function hedgeWithTaker({ filledTokenId, filledSize, orderIds, results, entryBase, source }) {
     const upTokenId = activeTokens?.upTokenId;
     const downTokenId = activeTokens?.downTokenId;
     const hedgeTokenId = filledTokenId === upTokenId ? downTokenId : upTokenId;
@@ -922,11 +922,12 @@ export default function Page() {
     }
 
     const hedgeAsk = hedgeTokenId === upTokenId ? hedgePlan.upAsk : hedgePlan.downAsk;
-    const hedgeLimitPrice = Number.isFinite(hedgeAsk) ? hedgeAsk : null;
-    const hedgeAmount = Number.isFinite(hedgeLimitPrice) ? roundToCent(filledSize * hedgeLimitPrice) : null;
+    const fallbackTakerPrice = 0.99;
+    const hedgeLimitPrice = Number.isFinite(hedgeAsk) ? hedgeAsk : fallbackTakerPrice;
+    const hedgeSize = filledSize;
 
-    if (!hedgeAmount || hedgeAmount <= 0) {
-      const message = "Partial fill detected; unable to compute hedge amount";
+    if (!hedgeSize || hedgeSize <= 0 || !Number.isFinite(hedgeLimitPrice)) {
+      const message = "Partial fill detected; unable to compute hedge order";
       setTradeStatus({ type: "error", message, results });
       if (source === "auto") {
         setAutoStatus({ type: "error", message });
@@ -940,15 +941,16 @@ export default function Page() {
       return { ok: false, message };
     }
 
-    const hedgeRes = await fetch("/api/trade/market", {
+    const hedgeRes = await fetch("/api/trade/limit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         tokenId: hedgeTokenId,
         side: "BUY",
-        amount: hedgeAmount,
-        price: hedgeLimitPrice ?? undefined,
-        orderType: "FAK"
+        price: hedgeLimitPrice,
+        size: hedgeSize,
+        orderType: "GTC",
+        postOnly: false
       })
     });
     const hedgeData = await hedgeRes.json().catch(() => ({}));
@@ -972,9 +974,17 @@ export default function Page() {
     const hedgeFilled = hedgePoll?.filled;
     const hedgeStatus = hedgePoll?.status || hedgeData?.status || "unknown";
 
+    if (!hedgeFilled && hedgeOrderId) {
+      await fetch("/api/trade/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId: hedgeOrderId })
+      });
+    }
+
     const message = hedgeFilled
-      ? "One leg filled; hedge FAK filled"
-      : `One leg filled; hedge status ${hedgeStatus}`;
+      ? "One leg filled; taker hedge filled"
+      : `One leg filled; taker hedge status ${hedgeStatus}`;
     setTradeStatus({ type: hedgeFilled ? "success" : "error", message, results });
     if (source === "auto") {
       setAutoStatus({ type: hedgeFilled ? "success" : "error", message });
@@ -984,7 +994,7 @@ export default function Page() {
       status: hedgeFilled ? "hedged" : "error",
       orderIds: hedgeOrderId ? [...orderIds, hedgeOrderId] : orderIds,
       error: hedgeFilled ? undefined : message,
-      note: `Hedge ${hedgeFilled ? "filled" : "attempted"} via FAK`
+      note: `Hedge ${hedgeFilled ? "filled" : "attempted"} via taker limit`
     });
     return { ok: hedgeFilled, message };
   }
@@ -1055,7 +1065,7 @@ export default function Page() {
       ];
 
     const results = {};
-    const orderType = "FOK";
+    const orderType = "GTC";
 
     try {
       const requests = payloads.map(async (payload) => {
@@ -1068,7 +1078,7 @@ export default function Page() {
             price: payload.price,
             size: hedgeSize,
             orderType,
-            postOnly: false
+            postOnly: true
           })
         });
         const data = await res.json().catch(() => ({}));
@@ -1105,7 +1115,7 @@ export default function Page() {
             const filledSize = Number.isFinite(filled[0].poll?.matched) ? filled[0].poll.matched : hedgeSize;
 
             if (filledTokenId) {
-              await hedgeWithFak({
+              await hedgeWithTaker({
                 filledTokenId,
                 filledSize,
                 orderIds,
@@ -1239,7 +1249,7 @@ export default function Page() {
 
       const filledEntry = filled[0];
       const filledSize = Number.isFinite(filledEntry.poll?.matched) ? filledEntry.poll.matched : hedgeSize;
-      await hedgeWithFak({
+      await hedgeWithTaker({
         filledTokenId: filledEntry.tokenId,
         filledSize,
         orderIds,
