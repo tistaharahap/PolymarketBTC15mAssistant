@@ -81,7 +81,7 @@ function normalizeStatus(value) {
 }
 
 function isTerminalStatus(status) {
-  return ["filled", "cancelled", "canceled", "expired", "rejected"].includes(status);
+  return ["filled", "matched", "cancelled", "canceled", "expired", "rejected"].includes(status);
 }
 
 function parseSizeValue(value) {
@@ -93,8 +93,9 @@ function getFillStats(order, fallbackSize) {
   const original = parseSizeValue(order?.original_size ?? order?.originalSize ?? fallbackSize);
   const matched = parseSizeValue(order?.size_matched ?? order?.sizeMatched ?? 0) ?? 0;
   const status = normalizeStatus(order?.status);
-  const filled = original !== null ? matched >= original - 1e-6 : status === "filled";
-  return { original, matched, filled, status };
+  const filled = original !== null ? matched >= original - 1e-6 : status === "filled" || status === "matched";
+  const hasMatch = matched > 0;
+  return { original, matched, filled, hasMatch, status };
 }
 
 async function pollOrderStatus(orderId, { intervalMs = ORDER_POLL_INTERVAL_MS, timeoutMs = ORDER_POLL_TIMEOUT_MS } = {}) {
@@ -104,12 +105,15 @@ async function pollOrderStatus(orderId, { intervalMs = ORDER_POLL_INTERVAL_MS, t
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`/api/trade/order?orderId=${encodeURIComponent(orderId)}`, { cache: "no-store" });
+      if (res.status === 404) {
+        return { order: null, original: null, matched: 0, filled: false, hasMatch: false, status: "missing", missing: true, timedOut: false };
+      }
       if (res.ok) {
         const order = await res.json();
         last = order;
         const stats = getFillStats(order, null);
         if (stats.filled || isTerminalStatus(stats.status)) {
-          return { order, ...stats, timedOut: false };
+          return { order, ...stats, missing: false, timedOut: false };
         }
       }
     } catch {
@@ -120,7 +124,7 @@ async function pollOrderStatus(orderId, { intervalMs = ORDER_POLL_INTERVAL_MS, t
   }
 
   const stats = getFillStats(last, null);
-  return { order: last, ...stats, timedOut: true };
+  return { order: last, ...stats, missing: false, timedOut: true };
 }
 
 function computeDeltaSeries(candles, period = DELTA_PERIOD, mode = DELTA_MODE) {
@@ -901,7 +905,7 @@ export default function Page() {
     });
   }
 
-  async function hedgeWithTaker({ filledTokenId, filledSize, orderIds, results, entryBase, source }) {
+  async function hedgeWithTaker({ filledTokenId, filledSize, orderIds, results, entryBase, source, note }) {
     const upTokenId = activeTokens?.upTokenId;
     const downTokenId = activeTokens?.downTokenId;
     const hedgeTokenId = filledTokenId === upTokenId ? downTokenId : upTokenId;
@@ -994,7 +998,7 @@ export default function Page() {
       status: hedgeFilled ? "hedged" : "error",
       orderIds: hedgeOrderId ? [...orderIds, hedgeOrderId] : orderIds,
       error: hedgeFilled ? undefined : message,
-      note: `Hedge ${hedgeFilled ? "filled" : "attempted"} via taker limit`
+      note: note || `Hedge ${hedgeFilled ? "filled" : "attempted"} via taker limit`
     });
     return { ok: hedgeFilled, message };
   }
@@ -1198,19 +1202,107 @@ export default function Page() {
         poll: await pollOrderStatus(entry.orderId)
       })));
 
+      const withMatch = polled.filter((entry) => entry.poll?.hasMatch);
+      const missing = polled.filter((entry) => entry.poll?.missing);
       const filled = polled.filter((entry) => entry.poll?.filled);
-      const unfilled = polled.filter((entry) => !entry.poll?.filled);
+      const openEntries = polled.filter((entry) => !entry.poll?.missing && !isTerminalStatus(entry.poll?.status));
 
-      const openToCancel = unfilled.filter((entry) => !isTerminalStatus(entry.poll?.status));
-      if (openToCancel.length) {
-        await Promise.allSettled(openToCancel.map(async (entry) => {
+      const cancelOpenOrders = async () => {
+        if (!openEntries.length) return;
+        await Promise.allSettled(openEntries.map(async (entry) => {
           await fetch("/api/trade/cancel", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ orderId: entry.orderId })
           });
         }));
+      };
+
+      if (withMatch.length === 2) {
+        const [a, b] = withMatch;
+        const aMatched = Number.isFinite(a.poll?.matched) ? a.poll.matched : 0;
+        const bMatched = Number.isFinite(b.poll?.matched) ? b.poll.matched : 0;
+        const diff = Math.abs(aMatched - bMatched);
+        await cancelOpenOrders();
+
+        if (diff > 1e-6) {
+          const smaller = aMatched < bMatched ? a : b;
+          await hedgeWithTaker({
+            filledTokenId: smaller.tokenId,
+            filledSize: diff,
+            orderIds,
+            results,
+            entryBase,
+            source,
+            note: "Imbalanced fills; hedged difference via taker limit"
+          });
+          return;
+        }
+
+        const message = "Both legs partially filled; canceled remainder";
+        setTradeStatus({ type: "success", message, results });
+        if (source === "auto") {
+          setAutoStatus({ type: "success", message });
+        }
+        addHistoryEntry({
+          ...entryBase,
+          status: "success",
+          orderIds,
+          note: message
+        });
+        return;
       }
+
+      if (withMatch.length === 1) {
+        await cancelOpenOrders();
+        const matchedEntry = withMatch[0];
+        const matchedSize = Number.isFinite(matchedEntry.poll?.matched) ? matchedEntry.poll.matched : hedgeSize;
+        await hedgeWithTaker({
+          filledTokenId: matchedEntry.tokenId,
+          filledSize: matchedSize,
+          orderIds,
+          results,
+          entryBase,
+          source,
+          note: "Partial fill detected; hedged matched size via taker limit"
+        });
+        return;
+      }
+
+      if (missing.length === 1) {
+        await cancelOpenOrders();
+        const missingEntry = missing[0];
+        await hedgeWithTaker({
+          filledTokenId: missingEntry.tokenId,
+          filledSize: hedgeSize,
+          orderIds,
+          results,
+          entryBase,
+          source,
+          note: "Order not found; assumed filled and hedged via taker limit"
+        });
+        return;
+      }
+
+      if (missing.length === 2) {
+        setTradeStatus({
+          type: "success",
+          message: "Orders no longer open (assumed closed)",
+          results
+        });
+        if (source === "auto") {
+          setAutoStatus({ type: "success", message: "Orders no longer open (assumed closed)" });
+        }
+        addHistoryEntry({
+          ...entryBase,
+          status: "success",
+          orderIds,
+          note: "Both orders not found; assumed closed"
+        });
+        return;
+      }
+
+      await cancelOpenOrders();
 
       if (filled.length === 2) {
         setTradeStatus({
