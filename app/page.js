@@ -75,6 +75,8 @@ const DELTA_PERIOD = 21;
 const DELTA_MODE = "EMA";
 const ORDER_POLL_INTERVAL_MS = 1500;
 const ORDER_POLL_TIMEOUT_MS = 60_000;
+const HEDGE_TAKER_BUFFER_CENTS = 10;
+const HEDGE_TAKER_MAX_PRICE = 0.99;
 
 function normalizeStatus(value) {
   return String(value ?? "").toLowerCase();
@@ -928,8 +930,13 @@ export default function Page() {
     }
 
     const hedgeAsk = hedgeTokenId === upTokenId ? hedgePlan.upAsk : hedgePlan.downAsk;
-    const fallbackTakerPrice = 0.99;
-    const hedgeLimitPrice = Number.isFinite(hedgeAsk) ? hedgeAsk : fallbackTakerPrice;
+    const fallbackTakerPrice = HEDGE_TAKER_MAX_PRICE;
+    const hedgeLimitPrice = Number.isFinite(hedgeAsk)
+      ? Math.min(
+        HEDGE_TAKER_MAX_PRICE,
+        roundToCent(hedgeAsk + HEDGE_TAKER_BUFFER_CENTS / 100)
+      )
+      : fallbackTakerPrice;
     const hedgeSize = filledSize;
 
     if (!hedgeSize || hedgeSize <= 0 || !Number.isFinite(hedgeLimitPrice)) {
@@ -955,7 +962,7 @@ export default function Page() {
         side: "BUY",
         price: hedgeLimitPrice,
         size: hedgeSize,
-        orderType: "GTC",
+        orderType: "FAK",
         postOnly: false
       })
     });
