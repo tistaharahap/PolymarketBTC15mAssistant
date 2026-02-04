@@ -909,6 +909,8 @@ export default function Page() {
     const upTokenId = activeTokens?.upTokenId;
     const downTokenId = activeTokens?.downTokenId;
     const hedgeTokenId = filledTokenId === upTokenId ? downTokenId : upTokenId;
+    const filledLeg = filledTokenId === upTokenId ? "UP" : filledTokenId === downTokenId ? "DOWN" : "UNKNOWN";
+    const hedgeLeg = hedgeTokenId === upTokenId ? "UP" : hedgeTokenId === downTokenId ? "DOWN" : "UNKNOWN";
 
     if (!hedgeTokenId) {
       const message = "Partial fill detected; missing hedge token";
@@ -998,7 +1000,10 @@ export default function Page() {
       status: hedgeFilled ? "hedged" : "error",
       orderIds: hedgeOrderId ? [...orderIds, hedgeOrderId] : orderIds,
       error: hedgeFilled ? undefined : message,
-      note: note || `Hedge ${hedgeFilled ? "filled" : "attempted"} via taker limit`
+      note: note || `Hedge ${hedgeFilled ? "filled" : "attempted"} via taker limit`,
+      filledLeg,
+      hedgeLeg,
+      hedgeSize: filledSize
     });
     return { ok: hedgeFilled, message };
   }
@@ -1226,9 +1231,9 @@ export default function Page() {
         await cancelOpenOrders();
 
         if (diff > 1e-6) {
-          const smaller = aMatched < bMatched ? a : b;
+          const larger = aMatched >= bMatched ? a : b;
           await hedgeWithTaker({
-            filledTokenId: smaller.tokenId,
+            filledTokenId: larger.tokenId,
             filledSize: diff,
             orderIds,
             results,
@@ -1612,6 +1617,11 @@ export default function Page() {
                       </div>
                       {entry.orderIds?.length ? (
                         <div className="tradeHistoryRow mono">Order IDs: {entry.orderIds.join(", ")}</div>
+                      ) : null}
+                      {entry.hedgeLeg ? (
+                        <div className="tradeHistoryRow">
+                          Hedge: {entry.hedgeLeg} {entry.hedgeSize ? `${fmtNum(entry.hedgeSize, 0)} sh` : "-"} · Triggered by {entry.filledLeg ?? "-"}
+                        </div>
                       ) : null}
                       {entry.note ? (
                         <div className="tradeHistoryRow">{entry.note}</div>
