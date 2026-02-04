@@ -901,6 +901,94 @@ export default function Page() {
     });
   }
 
+  async function hedgeWithFak({ filledTokenId, filledSize, orderIds, results, entryBase, source }) {
+    const upTokenId = activeTokens?.upTokenId;
+    const downTokenId = activeTokens?.downTokenId;
+    const hedgeTokenId = filledTokenId === upTokenId ? downTokenId : upTokenId;
+
+    if (!hedgeTokenId) {
+      const message = "Partial fill detected; missing hedge token";
+      setTradeStatus({ type: "error", message, results });
+      if (source === "auto") {
+        setAutoStatus({ type: "error", message });
+      }
+      addHistoryEntry({
+        ...entryBase,
+        status: "error",
+        orderIds,
+        error: message
+      });
+      return { ok: false, message };
+    }
+
+    const hedgeAsk = hedgeTokenId === upTokenId ? hedgePlan.upAsk : hedgePlan.downAsk;
+    const hedgeLimitPrice = Number.isFinite(hedgeAsk) ? hedgeAsk : null;
+    const hedgeAmount = Number.isFinite(hedgeLimitPrice) ? roundToCent(filledSize * hedgeLimitPrice) : null;
+
+    if (!hedgeAmount || hedgeAmount <= 0) {
+      const message = "Partial fill detected; unable to compute hedge amount";
+      setTradeStatus({ type: "error", message, results });
+      if (source === "auto") {
+        setAutoStatus({ type: "error", message });
+      }
+      addHistoryEntry({
+        ...entryBase,
+        status: "error",
+        orderIds,
+        error: message
+      });
+      return { ok: false, message };
+    }
+
+    const hedgeRes = await fetch("/api/trade/market", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tokenId: hedgeTokenId,
+        side: "BUY",
+        amount: hedgeAmount,
+        price: hedgeLimitPrice ?? undefined,
+        orderType: "FAK"
+      })
+    });
+    const hedgeData = await hedgeRes.json().catch(() => ({}));
+    if (!hedgeRes.ok) {
+      const message = hedgeData?.error || `Hedge order failed (HTTP ${hedgeRes.status})`;
+      setTradeStatus({ type: "error", message, results });
+      if (source === "auto") {
+        setAutoStatus({ type: "error", message });
+      }
+      addHistoryEntry({
+        ...entryBase,
+        status: "error",
+        orderIds,
+        error: message
+      });
+      return { ok: false, message };
+    }
+
+    const hedgeOrderId = hedgeData?.orderId;
+    const hedgePoll = hedgeOrderId ? await pollOrderStatus(hedgeOrderId) : null;
+    const hedgeFilled = hedgePoll?.filled;
+    const hedgeStatus = hedgePoll?.status || hedgeData?.status || "unknown";
+
+    const message = hedgeFilled
+      ? "One leg filled; hedge FAK filled"
+      : `One leg filled; hedge status ${hedgeStatus}`;
+    setTradeStatus({ type: hedgeFilled ? "success" : "error", message, results });
+    if (source === "auto") {
+      setAutoStatus({ type: hedgeFilled ? "success" : "error", message });
+    }
+    addHistoryEntry({
+      ...entryBase,
+      status: hedgeFilled ? "hedged" : "error",
+      orderIds: hedgeOrderId ? [...orderIds, hedgeOrderId] : orderIds,
+      error: hedgeFilled ? undefined : message,
+      note: `Hedge ${hedgeFilled ? "filled" : "attempted"} via FAK`
+    });
+    return { ok: hedgeFilled, message };
+  }
+
   async function submitHedgeOrders({ source = "manual" } = {}) {
     const entryBase = {
       ts: Date.now(),
@@ -1005,6 +1093,30 @@ export default function Page() {
           .filter(Boolean);
 
         if (orderIds.length) {
+          const polled = await Promise.all(orderIds.map(async (orderId) => pollOrderStatus(orderId)));
+          const filled = polled
+            .map((poll, idx) => ({ poll, orderId: orderIds[idx] }))
+            .filter((entry) => entry.poll?.filled);
+
+          if (filled.length) {
+            const filledOrderId = filled[0].orderId;
+            const filledTokenId = Object.entries(results)
+              .find(([, data]) => data?.orderId === filledOrderId)?.[0] ?? null;
+            const filledSize = Number.isFinite(filled[0].poll?.matched) ? filled[0].poll.matched : hedgeSize;
+
+            if (filledTokenId) {
+              await hedgeWithFak({
+                filledTokenId,
+                filledSize,
+                orderIds,
+                results,
+                entryBase,
+                source
+              });
+              return;
+            }
+          }
+
           const cancelResults = await Promise.allSettled(orderIds.map(async (orderId) => {
             const res = await fetch("/api/trade/cancel", {
               method: "POST",
@@ -1126,73 +1238,14 @@ export default function Page() {
       }
 
       const filledEntry = filled[0];
-      const unfilledEntry = unfilled[0];
       const filledSize = Number.isFinite(filledEntry.poll?.matched) ? filledEntry.poll.matched : hedgeSize;
-      const hedgeTokenId = unfilledEntry.tokenId;
-      const hedgeAsk = hedgeTokenId === upTokenId ? hedgePlan.upAsk : hedgePlan.downAsk;
-      const hedgeLimitPrice = Number.isFinite(hedgeAsk) ? hedgeAsk : unfilledEntry.poll?.order?.price ?? null;
-      const hedgeAmount = Number.isFinite(hedgeLimitPrice) ? roundToCent(filledSize * hedgeLimitPrice) : null;
-
-      if (!hedgeAmount || hedgeAmount <= 0) {
-        const message = "Partial fill detected; unable to compute hedge amount";
-        setTradeStatus({ type: "error", message, results });
-        if (source === "auto") {
-          setAutoStatus({ type: "error", message });
-        }
-        addHistoryEntry({
-          ...entryBase,
-          status: "error",
-          orderIds,
-          error: message
-        });
-        return;
-      }
-
-      const hedgeRes = await fetch("/api/trade/market", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tokenId: hedgeTokenId,
-          side: "BUY",
-          amount: hedgeAmount,
-          price: hedgeLimitPrice ?? undefined,
-          orderType: "FAK"
-        })
-      });
-      const hedgeData = await hedgeRes.json().catch(() => ({}));
-      if (!hedgeRes.ok) {
-        const message = hedgeData?.error || `Hedge order failed (HTTP ${hedgeRes.status})`;
-        setTradeStatus({ type: "error", message, results });
-        if (source === "auto") {
-          setAutoStatus({ type: "error", message });
-        }
-        addHistoryEntry({
-          ...entryBase,
-          status: "error",
-          orderIds,
-          error: message
-        });
-        return;
-      }
-
-      const hedgeOrderId = hedgeData?.orderId;
-      const hedgePoll = hedgeOrderId ? await pollOrderStatus(hedgeOrderId) : null;
-      const hedgeFilled = hedgePoll?.filled;
-      const hedgeStatus = hedgePoll?.status || hedgeData?.status || "unknown";
-
-      const message = hedgeFilled
-        ? "One leg filled; hedge FAK filled"
-        : `One leg filled; hedge status ${hedgeStatus}`;
-      setTradeStatus({ type: hedgeFilled ? "success" : "error", message, results });
-      if (source === "auto") {
-        setAutoStatus({ type: hedgeFilled ? "success" : "error", message });
-      }
-      addHistoryEntry({
-        ...entryBase,
-        status: hedgeFilled ? "hedged" : "error",
-        orderIds: hedgeOrderId ? [...orderIds, hedgeOrderId] : orderIds,
-        error: hedgeFilled ? undefined : message,
-        note: `Hedge ${hedgeFilled ? "filled" : "attempted"} via FAK`
+      await hedgeWithFak({
+        filledTokenId: filledEntry.tokenId,
+        filledSize,
+        orderIds,
+        results,
+        entryBase,
+        source
       });
     } catch (err) {
       setTradeStatus({
