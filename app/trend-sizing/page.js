@@ -34,6 +34,14 @@ function fmtRatio(n, digits = 2) {
   return `${fmtNum(n, digits)}x`;
 }
 
+function tooltip(text) {
+  return (
+    <span className="tooltip" aria-label={text} data-tip={text}>
+      ?
+    </span>
+  );
+}
+
 function fmtTimeLeftSec(value) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return "-";
   const total = Math.max(0, Math.floor(Number(value)));
@@ -290,6 +298,11 @@ export default function TrendSizingPage() {
     const upPnl = upMark !== null ? (positionsRef.current.Up ?? 0) * (upMark - (avgCostRef.current.Up ?? 0)) : null;
     const downPnl = downMark !== null ? (positionsRef.current.Down ?? 0) * (downMark - (avgCostRef.current.Down ?? 0)) : null;
     const total = upPnl !== null && downPnl !== null ? upPnl + downPnl : null;
+    const winner = upMark === null || downMark === null ? null : (upMark >= downMark ? "Up" : "Down");
+    const winnerShares = winner === "Up" ? (positionsRef.current.Up ?? 0) : winner === "Down" ? (positionsRef.current.Down ?? 0) : 0;
+    const totalCost = (avgCostRef.current.Up ?? 0) * (positionsRef.current.Up ?? 0)
+      + (avgCostRef.current.Down ?? 0) * (positionsRef.current.Down ?? 0);
+    const settlementPnl = winner ? winnerShares - totalCost : null;
 
     const entry = {
       id: `${slug ?? "window"}-${Date.now()}`,
@@ -305,6 +318,7 @@ export default function TrendSizingPage() {
         Down: (avgCostRef.current.Down ?? 0) * (positionsRef.current.Down ?? 0)
       },
       pnl: { up: upPnl, down: downPnl, total },
+      settlement: { winner, winnerShares, pnl: settlementPnl },
       marks: { up: upMark, down: downMark },
       trades: trades.length
     };
@@ -680,12 +694,38 @@ export default function TrendSizingPage() {
   };
 
   const pnl = useMemo(() => {
-    const upMark = Number.isFinite(upBid) ? upBid : null;
-    const downMark = Number.isFinite(downBid) ? downBid : null;
+    const fallbackUp = Number.isFinite(lastBboRef.current.upBid) ? lastBboRef.current.upBid : null;
+    const fallbackDown = Number.isFinite(lastBboRef.current.downBid) ? lastBboRef.current.downBid : null;
+    const upMark = Number.isFinite(upBid) ? upBid : fallbackUp;
+    const downMark = Number.isFinite(downBid) ? downBid : fallbackDown;
     const upPnl = upMark !== null ? (positions.Up ?? 0) * (upMark - (avgCost.Up ?? 0)) : null;
     const downPnl = downMark !== null ? (positions.Down ?? 0) * (downMark - (avgCost.Down ?? 0)) : null;
     const total = upPnl !== null && downPnl !== null ? upPnl + downPnl : null;
-    return { upPnl, downPnl, total };
+    const winner = upMark === null || downMark === null ? null : (upMark >= downMark ? "Up" : "Down");
+    const winnerShares = winner === "Up" ? (positions.Up ?? 0) : winner === "Down" ? (positions.Down ?? 0) : 0;
+    const totalCost = (avgCost.Up ?? 0) * (positions.Up ?? 0) + (avgCost.Down ?? 0) * (positions.Down ?? 0);
+    const settlement = winner ? winnerShares - totalCost : null;
+    const safeUp = upPnl ?? 0;
+    const safeDown = downPnl ?? 0;
+    const safeTotal = total ?? (safeUp + safeDown);
+    const safeWinner = winner ?? (fallbackUp !== null && fallbackDown !== null ? (fallbackUp >= fallbackDown ? "Up" : "Down") : "Up");
+    const safeSettlement = settlement ?? (safeWinner === "Up"
+      ? (positions.Up ?? 0) - totalCost
+      : (positions.Down ?? 0) - totalCost);
+    return {
+      upPnl,
+      downPnl,
+      total,
+      settlement,
+      winner,
+      safe: {
+        up: safeUp,
+        down: safeDown,
+        total: safeTotal,
+        winner: safeWinner,
+        settlement: safeSettlement
+      }
+    };
   }, [positions, avgCost, upBid, downBid]);
 
   return (
@@ -717,7 +757,7 @@ export default function TrendSizingPage() {
       {metaErr ? <div className="error">{metaErr}</div> : null}
 
       <div className="grid">
-        <section className="card">
+        <section className="card overflowVisible">
           <div className="cardTop">
             <div className="cardTitle">Payout Ratio Chart</div>
             <div className="ratioLegend">
@@ -804,13 +844,20 @@ export default function TrendSizingPage() {
                 <div className="kv">
                   <div className="k">Unrealized PnL</div>
                   <div className="v posSplit mono">
-                    <span>Up {pnl.upPnl === null ? "-" : fmtUsd(pnl.upPnl, 2)}</span>
-                    <span>Down {pnl.downPnl === null ? "-" : fmtUsd(pnl.downPnl, 2)}</span>
+                    <span>Up {fmtUsd(pnl.safe.up, 2)}</span>
+                    <span>Down {fmtUsd(pnl.safe.down, 2)}</span>
                   </div>
                 </div>
                 <div className="kv">
                   <div className="k">Total PnL</div>
-                  <div className="v mono">{pnl.total === null ? "-" : fmtUsd(pnl.total, 2)}</div>
+                  <div className="v mono">{fmtUsd(pnl.safe.total, 2)}</div>
+                </div>
+                <div className="kv">
+                  <div className="k">Settlement PnL</div>
+                  <div className="v posSplit mono">
+                    <span>{pnl.safe.winner}</span>
+                    <span>{fmtUsd(pnl.safe.settlement, 2)}</span>
+                  </div>
                 </div>
                 <div className="kv">
                   <div className="k">Trades</div>
@@ -850,6 +897,10 @@ export default function TrendSizingPage() {
                           <span>PnL: Up {entry.pnl?.up === null ? "-" : fmtUsd(entry.pnl.up, 2)} · Down {entry.pnl?.down === null ? "-" : fmtUsd(entry.pnl.down, 2)}</span>
                           <span>Total {entry.pnl?.total === null ? "-" : fmtUsd(entry.pnl.total, 2)}</span>
                         </div>
+                        <div className="tradeHistoryRow">
+                          <span>Winner: {entry.settlement?.winner ?? "-"}</span>
+                          <span>Settlement PnL: {entry.settlement?.pnl === null ? "-" : fmtUsd(entry.settlement.pnl, 2)}</span>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -868,7 +919,7 @@ export default function TrendSizingPage() {
           <div className="cardBody">
             <div className="tradeControls">
               <div className="tradeControl">
-                <div className="tradeControlLabel">Buy Ratio Min</div>
+                <div className="tradeControlLabel">Buy Ratio Min {tooltip("Minimum buy payout ratio required to allow BUY signals. Buy ratio = (1 - ask) / ask. If below, BUY is blocked unless Winner Buy Gate passes.")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -882,7 +933,7 @@ export default function TrendSizingPage() {
                 <div className="tradeControlHint">Buy if ratio ≥ threshold</div>
               </div>
               <div className="tradeControl">
-                <div className="tradeControlLabel">Sell Ratio Min</div>
+                <div className="tradeControlLabel">Sell Ratio Min {tooltip("Minimum sell payout ratio required to allow SELL signals. Sell ratio = bid / (1 - bid).")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -896,7 +947,7 @@ export default function TrendSizingPage() {
                 <div className="tradeControlHint">Sell if ratio ≥ threshold</div>
               </div>
               <div className="tradeControl">
-                <div className="tradeControlLabel">Momentum Window (s)</div>
+                <div className="tradeControlLabel">Momentum Window (s) {tooltip("Lookback window used to compute ratio momentum slope (Δ ratio / Δ time).")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -910,7 +961,7 @@ export default function TrendSizingPage() {
                 />
               </div>
               <div className="tradeControl">
-                <div className="tradeControlLabel">Min Momentum / s</div>
+                <div className="tradeControlLabel">Min Momentum / s {tooltip("Minimum ratio slope per second required to allow a signal.")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -923,7 +974,7 @@ export default function TrendSizingPage() {
                 />
               </div>
               <div className="tradeControl">
-                <div className="tradeControlLabel">Base Size</div>
+                <div className="tradeControlLabel">Base Size {tooltip("Base share size for signals before scaling by ratio.")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -936,7 +987,7 @@ export default function TrendSizingPage() {
                 />
               </div>
               <div className="tradeControl">
-                <div className="tradeControlLabel">Max Size</div>
+                <div className="tradeControlLabel">Max Size {tooltip("Maximum share size cap for any signal or hedge.")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -949,7 +1000,7 @@ export default function TrendSizingPage() {
                 />
               </div>
               <div className="tradeControl">
-                <div className="tradeControlLabel">Size Scale</div>
+                <div className="tradeControlLabel">Size Scale {tooltip("Exponent for scaling size by ratio. Size = baseSize * (ratio/threshold)^scale, capped by Max Size.")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -962,7 +1013,7 @@ export default function TrendSizingPage() {
                 />
               </div>
               <div className="tradeControl">
-                <div className="tradeControlLabel">Cooldown (s)</div>
+                <div className="tradeControlLabel">Cooldown (s) {tooltip("Minimum seconds between identical signal triggers (per side).")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -980,19 +1031,19 @@ export default function TrendSizingPage() {
             <div className="toggleGrid" style={{ marginTop: 14 }}>
               <label className="toggleRow">
                 <input type="checkbox" checked={enableUpBuy} onChange={(e) => setEnableUpBuy(e.target.checked)} />
-                <span>Enable Up BUY</span>
+                <span>Enable Up BUY {tooltip("Allow BUY signals for the Up outcome.")}</span>
               </label>
               <label className="toggleRow">
                 <input type="checkbox" checked={enableUpSell} onChange={(e) => setEnableUpSell(e.target.checked)} />
-                <span>Enable Up SELL</span>
+                <span>Enable Up SELL {tooltip("Allow SELL signals for the Up outcome (requires position).")}</span>
               </label>
               <label className="toggleRow">
                 <input type="checkbox" checked={enableDownBuy} onChange={(e) => setEnableDownBuy(e.target.checked)} />
-                <span>Enable Down BUY</span>
+                <span>Enable Down BUY {tooltip("Allow BUY signals for the Down outcome.")}</span>
               </label>
               <label className="toggleRow">
                 <input type="checkbox" checked={enableDownSell} onChange={(e) => setEnableDownSell(e.target.checked)} />
-                <span>Enable Down SELL</span>
+                <span>Enable Down SELL {tooltip("Allow SELL signals for the Down outcome (requires position).")}</span>
               </label>
             </div>
 
@@ -1001,16 +1052,16 @@ export default function TrendSizingPage() {
               <div className="toggleGrid">
                 <label className="toggleRow">
                   <input type="checkbox" checked={hedgeEnabled} onChange={(e) => setHedgeEnabled(e.target.checked)} />
-                  <span>Enable Opposite BUY Hedge</span>
+                  <span>Enable Opposite BUY Hedge {tooltip("After a BUY, optionally BUY the opposite outcome if hedge ratio conditions pass.")}</span>
                 </label>
                 <div className="tradeControlHint">Hedge only when opposite buy ratio is within range.</div>
               </div>
               <div className="tradeControls" style={{ marginTop: 10 }}>
-                <div className="tradeControl">
-                  <div className="tradeControlLabel">Hedge Ratio Min</div>
-                  <input
-                    className="tradeInput"
-                    type="number"
+              <div className="tradeControl">
+                <div className="tradeControlLabel">Hedge Ratio Min {tooltip("Opposite buy ratio must be >= this to allow hedge BUY.")}</div>
+                <input
+                  className="tradeInput"
+                  type="number"
                     step="0.1"
                     value={hedgeRatioMin}
                     onChange={(e) => {
@@ -1019,11 +1070,11 @@ export default function TrendSizingPage() {
                     }}
                   />
                 </div>
-                <div className="tradeControl">
-                  <div className="tradeControlLabel">Hedge Ratio Max</div>
-                  <input
-                    className="tradeInput"
-                    type="number"
+              <div className="tradeControl">
+                <div className="tradeControlLabel">Hedge Ratio Max {tooltip("Opposite buy ratio must be <= this to allow hedge BUY.")}</div>
+                <input
+                  className="tradeInput"
+                  type="number"
                     step="0.1"
                     value={hedgeRatioMax}
                     onChange={(e) => {
@@ -1032,11 +1083,11 @@ export default function TrendSizingPage() {
                     }}
                   />
                 </div>
-                <div className="tradeControl">
-                  <div className="tradeControlLabel">Hedge Size Mult</div>
-                  <input
-                    className="tradeInput"
-                    type="number"
+              <div className="tradeControl">
+                <div className="tradeControlLabel">Hedge Size Mult {tooltip("Hedge size multiplier relative to the triggering BUY size (capped by Max Size).")}</div>
+                <input
+                  className="tradeInput"
+                  type="number"
                     step="0.1"
                     value={hedgeSizeMult}
                     onChange={(e) => {
@@ -1051,11 +1102,11 @@ export default function TrendSizingPage() {
             <div className="tradeTableWrap">
               <div className="cardTitle" style={{ marginBottom: 8 }}>Winner Buy Gate</div>
               <div className="tradeControls">
-                <div className="tradeControl">
-                  <div className="tradeControlLabel">Winner Buy Min Price</div>
-                  <input
-                    className="tradeInput"
-                    type="number"
+              <div className="tradeControl">
+                <div className="tradeControlLabel">Winner Buy Min Price {tooltip("If BUY ratio is below threshold, allow BUY if price >= this value (favored side gate).")}</div>
+                <input
+                  className="tradeInput"
+                  type="number"
                     step="0.01"
                     value={winnerBuyMinPrice}
                     onChange={(e) => {
@@ -1072,7 +1123,7 @@ export default function TrendSizingPage() {
                     checked={winnerBuyRequireFavored}
                     onChange={(e) => setWinnerBuyRequireFavored(e.target.checked)}
                   />
-                  <span>Require Favored Side</span>
+                  <span>Require Favored Side {tooltip("Winner Buy Gate applies only to the higher-priced (favored) side.")}</span>
                 </label>
               </div>
               <div className="tradeControlHint" style={{ marginTop: 6 }}>
@@ -1083,11 +1134,11 @@ export default function TrendSizingPage() {
             <div className="tradeTableWrap">
               <div className="cardTitle" style={{ marginBottom: 8 }}>End Window Rules</div>
               <div className="tradeControls">
-                <div className="tradeControl">
-                  <div className="tradeControlLabel">Stop Loser Buys (s)</div>
-                  <input
-                    className="tradeInput"
-                    type="number"
+              <div className="tradeControl">
+                <div className="tradeControlLabel">Stop Loser Buys (s) {tooltip("In the last N seconds, block BUYs on the non-favored side.")}</div>
+                <input
+                  className="tradeInput"
+                  type="number"
                     min="0"
                     step="1"
                     value={endClampLoserBuySec}
@@ -1097,11 +1148,11 @@ export default function TrendSizingPage() {
                     }}
                   />
                 </div>
-                <div className="tradeControl">
-                  <div className="tradeControlLabel">Hold Winner Sells (s)</div>
-                  <input
-                    className="tradeInput"
-                    type="number"
+              <div className="tradeControl">
+                <div className="tradeControlLabel">Hold Winner Sells (s) {tooltip("In the last N seconds, block SELLs on the favored side.")}</div>
+                <input
+                  className="tradeInput"
+                  type="number"
                     min="0"
                     step="1"
                     value={endClampWinnerSellSec}
