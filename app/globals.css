@@ -509,6 +509,51 @@ a{color:inherit}
   margin-top: 14px;
 }
 
+.ratioLegend{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+}
+
+.ratioTag{
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(27,42,68,.7);
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.ratioTag.upBuy{color: var(--green)}
+.ratioTag.upSell{color: var(--cyan)}
+.ratioTag.downBuy{color: var(--amber)}
+.ratioTag.downSell{color: var(--red)}
+
+.toggleGrid{
+  display:grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap:10px 14px;
+}
+
+.toggleRow{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.toggleRow input{
+  accent-color: var(--cyan);
+}
+
+.posSplit{
+  display:grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap:8px;
+  text-align:right;
+}
+
 .tradeTable{
   width: 100%;
   border-collapse: collapse;
