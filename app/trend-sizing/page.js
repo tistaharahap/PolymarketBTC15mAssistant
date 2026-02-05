@@ -203,7 +203,7 @@ export default function TrendSizingPage() {
   const [sellRatioMin, setSellRatioMin] = useState(20);
   const [momentumWindowSec, setMomentumWindowSec] = useState(15);
   const [minMomentum, setMinMomentum] = useState(0);
-  const [baseSize, setBaseSize] = useState(10);
+  const [baseSize, setBaseSize] = useState(5);
   const [maxSize, setMaxSize] = useState(200);
   const [sizeScale, setSizeScale] = useState(1);
   const [cooldownSec, setCooldownSec] = useState(5);
@@ -215,18 +215,24 @@ export default function TrendSizingPage() {
   const [winnerBuyRequireFavored, setWinnerBuyRequireFavored] = useState(true);
   const [endClampLoserBuySec, setEndClampLoserBuySec] = useState(DEFAULT_END_CLAMP_SEC);
   const [endClampWinnerSellSec, setEndClampWinnerSellSec] = useState(DEFAULT_END_CLAMP_SEC);
-  const [enableUpBuy, setEnableUpBuy] = useState(false);
+  const [enableUpBuy, setEnableUpBuy] = useState(true);
   const [enableUpSell, setEnableUpSell] = useState(true);
   const [enableDownBuy, setEnableDownBuy] = useState(true);
-  const [enableDownSell, setEnableDownSell] = useState(false);
+  const [enableDownSell, setEnableDownSell] = useState(true);
 
   const [ratioSeries, setRatioSeries] = useState({ upBuy: [], upSell: [], downBuy: [], downSell: [] });
   const ratioSeriesRef = useRef(ratioSeries);
 
   const [trades, setTrades] = useState([]);
   const lastTradeRef = useRef({});
+  const [windowHistory, setWindowHistory] = useState([]);
+  const lastWindowRef = useRef({ slug: null, start: null, end: null, asset: null });
   const positionsRef = useRef({ Up: 0, Down: 0 });
   const [positions, setPositions] = useState({ Up: 0, Down: 0 });
+  const avgCostRef = useRef({ Up: 0, Down: 0 });
+  const [avgCost, setAvgCost] = useState({ Up: 0, Down: 0 });
+  const [positionNotional, setPositionNotional] = useState({ Up: 0, Down: 0 });
+  const lastBboRef = useRef({ upBid: null, downBid: null });
   const [timeLeftSec, setTimeLeftSec] = useState(null);
   const timeLeftRef = useRef(null);
 
@@ -252,6 +258,59 @@ export default function TrendSizingPage() {
   useEffect(() => {
     ratioSeriesRef.current = ratioSeries;
   }, [ratioSeries]);
+
+  useEffect(() => {
+    if (!activeMarketSlug) return;
+    const prev = lastWindowRef.current?.slug;
+    if (prev && prev !== activeMarketSlug) {
+      recordWindow({
+        slug: prev,
+        startTime: lastWindowRef.current?.start,
+        endTime: lastWindowRef.current?.end,
+        asset: lastWindowRef.current?.asset
+      });
+      resetSim();
+    }
+    lastWindowRef.current = {
+      slug: activeMarketSlug,
+      start: meta?.polymarket?.marketStartTime ?? null,
+      end: meta?.polymarket?.marketEndTime ?? null,
+      asset: activeAsset
+    };
+  }, [activeMarketSlug, meta?.polymarket?.marketStartTime, meta?.polymarket?.marketEndTime, activeAsset]);
+
+  useEffect(() => {
+    if (Number.isFinite(upBid)) lastBboRef.current.upBid = upBid;
+    if (Number.isFinite(downBid)) lastBboRef.current.downBid = downBid;
+  }, [upBid, downBid]);
+
+  const recordWindow = ({ slug, startTime, endTime, asset }) => {
+    const upMark = Number.isFinite(lastBboRef.current.upBid) ? lastBboRef.current.upBid : null;
+    const downMark = Number.isFinite(lastBboRef.current.downBid) ? lastBboRef.current.downBid : null;
+    const upPnl = upMark !== null ? (positionsRef.current.Up ?? 0) * (upMark - (avgCostRef.current.Up ?? 0)) : null;
+    const downPnl = downMark !== null ? (positionsRef.current.Down ?? 0) * (downMark - (avgCostRef.current.Down ?? 0)) : null;
+    const total = upPnl !== null && downPnl !== null ? upPnl + downPnl : null;
+
+    const entry = {
+      id: `${slug ?? "window"}-${Date.now()}`,
+      ts: Date.now(),
+      asset,
+      marketSlug: slug,
+      startTime,
+      endTime,
+      positions: { ...positionsRef.current },
+      avgCost: { ...avgCostRef.current },
+      notional: {
+        Up: (avgCostRef.current.Up ?? 0) * (positionsRef.current.Up ?? 0),
+        Down: (avgCostRef.current.Down ?? 0) * (positionsRef.current.Down ?? 0)
+      },
+      pnl: { up: upPnl, down: downPnl, total },
+      marks: { up: upMark, down: downMark },
+      trades: trades.length
+    };
+
+    setWindowHistory((prev) => [entry, ...prev].slice(0, 200));
+  };
 
   useEffect(() => {
     let alive = true;
@@ -388,13 +447,22 @@ export default function TrendSizingPage() {
     const recordTrade = ({ outcome, side, price, ratio, momentum, threshold, reason, isHedge = false, hedgeOf = null, sizeOverride = null }) => {
       const size = sizeOverride ?? sizeFromRatio(ratio, threshold, side, outcome);
       if (!Number.isFinite(size) || size <= 0) return;
-      const delta = side === "BUY" ? size : -size;
-      const nextPos = {
-        ...positionsRef.current,
-        [outcome]: (positionsRef.current[outcome] ?? 0) + delta
-      };
+      const prevPos = positionsRef.current[outcome] ?? 0;
+      const prevAvg = avgCostRef.current[outcome] ?? 0;
+      const nextPosValue = side === "BUY" ? prevPos + size : Math.max(0, prevPos - size);
+      const nextAvg = side === "BUY"
+        ? (nextPosValue > 0 ? ((prevAvg * prevPos) + (price * size)) / nextPosValue : 0)
+        : (nextPosValue > 0 ? prevAvg : 0);
+      const nextPos = { ...positionsRef.current, [outcome]: nextPosValue };
+      const nextAvgMap = { ...avgCostRef.current, [outcome]: nextAvg };
       positionsRef.current = nextPos;
+      avgCostRef.current = nextAvgMap;
       setPositions(nextPos);
+      setAvgCost(nextAvgMap);
+      setPositionNotional({
+        Up: (nextAvgMap.Up ?? 0) * (nextPos.Up ?? 0),
+        Down: (nextAvgMap.Down ?? 0) * (nextPos.Down ?? 0)
+      });
       const entry = {
         id: `${nowSec}-${outcome}-${side}-${Math.random().toString(36).slice(2, 7)}`,
         ts: Date.now(),
@@ -406,6 +474,7 @@ export default function TrendSizingPage() {
         ratio,
         momentum,
         size,
+        notional: size * price,
         threshold,
         reason,
         positionAfter: nextPos[outcome],
@@ -587,9 +656,15 @@ export default function TrendSizingPage() {
 
   const resetSim = () => {
     setTrades([]);
-    setRatioSeries({ upBuy: [], upSell: [], downBuy: [], downSell: [] });
+    const empty = { upBuy: [], upSell: [], downBuy: [], downSell: [] };
+    setRatioSeries(empty);
+    ratioSeriesRef.current = empty;
     positionsRef.current = { Up: 0, Down: 0 };
     setPositions({ Up: 0, Down: 0 });
+    avgCostRef.current = { Up: 0, Down: 0 };
+    setAvgCost({ Up: 0, Down: 0 });
+    setPositionNotional({ Up: 0, Down: 0 });
+    setTimeLeftSec(null);
     lastTradeRef.current = {};
   };
 
@@ -603,6 +678,15 @@ export default function TrendSizingPage() {
     }
     return sized;
   };
+
+  const pnl = useMemo(() => {
+    const upMark = Number.isFinite(upBid) ? upBid : null;
+    const downMark = Number.isFinite(downBid) ? downBid : null;
+    const upPnl = upMark !== null ? (positions.Up ?? 0) * (upMark - (avgCost.Up ?? 0)) : null;
+    const downPnl = downMark !== null ? (positions.Down ?? 0) * (downMark - (avgCost.Down ?? 0)) : null;
+    const total = upPnl !== null && downPnl !== null ? upPnl + downPnl : null;
+    return { upPnl, downPnl, total };
+  }, [positions, avgCost, upBid, downBid]);
 
   return (
     <div className="container">
@@ -706,9 +790,27 @@ export default function TrendSizingPage() {
                 <div className="kv">
                   <div className="k">Positions</div>
                   <div className="v posSplit mono">
-                    <span>Up {fmtNum(positions.Up, 2)}</span>
-                    <span>Down {fmtNum(positions.Down, 2)}</span>
+                    <span>Up {fmtNum(positions.Up, 2)} · {fmtUsd(positionNotional.Up, 2)}</span>
+                    <span>Down {fmtNum(positions.Down, 2)} · {fmtUsd(positionNotional.Down, 2)}</span>
                   </div>
+                </div>
+                <div className="kv">
+                  <div className="k">Avg Cost</div>
+                  <div className="v posSplit mono">
+                    <span>Up {fmtUsd(avgCost.Up, 2)}</span>
+                    <span>Down {fmtUsd(avgCost.Down, 2)}</span>
+                  </div>
+                </div>
+                <div className="kv">
+                  <div className="k">Unrealized PnL</div>
+                  <div className="v posSplit mono">
+                    <span>Up {pnl.upPnl === null ? "-" : fmtUsd(pnl.upPnl, 2)}</span>
+                    <span>Down {pnl.downPnl === null ? "-" : fmtUsd(pnl.downPnl, 2)}</span>
+                  </div>
+                </div>
+                <div className="kv">
+                  <div className="k">Total PnL</div>
+                  <div className="v mono">{pnl.total === null ? "-" : fmtUsd(pnl.total, 2)}</div>
                 </div>
                 <div className="kv">
                   <div className="k">Trades</div>
@@ -720,6 +822,40 @@ export default function TrendSizingPage() {
                   </button>
                   <button className="btn" onClick={resetSim}>Clear</button>
                 </div>
+              </div>
+
+              <div className="tradeHistory windowHistory">
+                <div className="tradeHistoryHeader">
+                  <div className="cardTitle">Window PnL</div>
+                  <div className="tradeHistoryMeta mono">{windowHistory.length} windows</div>
+                </div>
+                {windowHistory.length ? (
+                  <div className="tradeHistoryList">
+                    {windowHistory.map((entry) => (
+                      <div key={entry.id} className="tradeHistoryItem">
+                        <div className="tradeHistoryRow">
+                          <span className="mono">{new Date(entry.ts).toLocaleTimeString()}</span>
+                          <span>{entry.asset ? entry.asset.toUpperCase() : "-"}</span>
+                          <span className="mono">{entry.marketSlug ?? "-"}</span>
+                        </div>
+                        <div className="tradeHistoryRow">
+                          <span>Avg Buy: Up {fmtUsd(entry.avgCost?.Up, 2)} · Down {fmtUsd(entry.avgCost?.Down, 2)}</span>
+                          <span>Marks: Up {fmtUsd(entry.marks?.up, 2)} · Down {fmtUsd(entry.marks?.down, 2)}</span>
+                        </div>
+                        <div className="tradeHistoryRow">
+                          <span>Notional: Up {fmtUsd(entry.notional?.Up, 2)} · Down {fmtUsd(entry.notional?.Down, 2)}</span>
+                          <span>Positions: Up {fmtNum(entry.positions?.Up, 2)} · Down {fmtNum(entry.positions?.Down, 2)}</span>
+                        </div>
+                        <div className="tradeHistoryRow">
+                          <span>PnL: Up {entry.pnl?.up === null ? "-" : fmtUsd(entry.pnl.up, 2)} · Down {entry.pnl?.down === null ? "-" : fmtUsd(entry.pnl.down, 2)}</span>
+                          <span>Total {entry.pnl?.total === null ? "-" : fmtUsd(entry.pnl.total, 2)}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="tradeHistoryEmpty">No window stats yet.</div>
+                )}
               </div>
             </div>
           </div>
@@ -1021,7 +1157,7 @@ export default function TrendSizingPage() {
                     {trade.isHedge ? <span className="tradeHistoryTag">HEDGE</span> : null}
                   </div>
                   <div className="tradeHistoryRow">
-                    <span>{trade.asset.toUpperCase()} · {fmtNum(trade.size, 0)} sh</span>
+                    <span>{trade.asset.toUpperCase()} · {fmtNum(trade.size, 0)} sh · {fmtUsd(trade.notional, 2)}</span>
                     <span>Price {fmtUsd(trade.price, 2)} · Ratio {fmtRatio(trade.ratio, 2)}</span>
                   </div>
                   <div className="tradeHistoryRow">
