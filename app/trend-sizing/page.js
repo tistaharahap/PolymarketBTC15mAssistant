@@ -15,6 +15,17 @@ const RATIO_POINTS_LIMIT = 1200;
 const MAX_BUY_PRICE = 0.99;
 const MIN_BUY_PRICE = 0.01;
 const DEFAULT_END_CLAMP_SEC = 120;
+const SQRT_TWO_PI = Math.sqrt(2 * Math.PI);
+const VOL_TIME_SCALE_SEC = 60;
+const VOL_RATIO_TIGHTEN = 1.0;
+const VOL_MOMENTUM_BUMP = 0.01;
+const VOL_SIZE_DAMP = 0.8;
+const TIME_RATIO_TIGHTEN = 0.5;
+const TIME_MOMENTUM_BUMP = 0.005;
+const TIME_SIZE_DAMP_MIN = 0.5;
+const SPREAD_BASE_MAX = 0.03;
+const SPREAD_TIME_TIGHTEN = 0.02;
+const SPREAD_VOL_TIGHTEN = 0.02;
 
 function fmtNum(n, digits = 2) {
   if (n === null || n === undefined || !Number.isFinite(Number(n))) return "-";
@@ -32,6 +43,10 @@ function fmtUsd(n, digits = 2) {
 function fmtRatio(n, digits = 2) {
   if (n === null || n === undefined || !Number.isFinite(Number(n))) return "-";
   return `${fmtNum(n, digits)}x`;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function tooltip(text) {
@@ -58,6 +73,58 @@ function buyPayoutRatio(price) {
 function sellPayoutRatio(price) {
   if (!Number.isFinite(price) || price >= 1) return null;
   return price / (1 - price);
+}
+
+function normPdf(x) {
+  return Math.exp(-0.5 * x * x) / SQRT_TWO_PI;
+}
+
+function normInv(p) {
+  if (!Number.isFinite(p) || p <= 0 || p >= 1) return null;
+  const a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357751867269, -30.66479806614716, 2.506628277459239];
+  const b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
+  const c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+  const d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
+  const plow = 0.02425;
+  const phigh = 1 - plow;
+  let q = 0;
+  let r = 0;
+  if (p < plow) {
+    q = Math.sqrt(-2 * Math.log(p));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+      / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  if (p > phigh) {
+    q = Math.sqrt(-2 * Math.log(1 - p));
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+      / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  q = p - 0.5;
+  r = q * q;
+  return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
+    / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+}
+
+function impliedVolScore(price, timeLeftSec) {
+  if (!Number.isFinite(price) || !Number.isFinite(timeLeftSec) || timeLeftSec <= 0) return null;
+  const p = clamp(price, 1e-4, 1 - 1e-4);
+  const z = normInv(p);
+  if (z === null) return null;
+  const denom = Math.sqrt(Math.max(1, timeLeftSec / VOL_TIME_SCALE_SEC));
+  return normPdf(z) / denom;
+}
+
+function midPrice(bid, ask) {
+  if (Number.isFinite(bid) && Number.isFinite(ask)) return (bid + ask) / 2;
+  if (Number.isFinite(bid)) return bid;
+  if (Number.isFinite(ask)) return ask;
+  return null;
+}
+
+function computeSpreadLimit(timeFrac, volScore) {
+  const timePenalty = Number.isFinite(timeFrac) ? (1 - timeFrac) * SPREAD_TIME_TIGHTEN : 0;
+  const volPenalty = Number.isFinite(volScore) ? volScore * SPREAD_VOL_TIGHTEN : 0;
+  return clamp(SPREAD_BASE_MAX - timePenalty - volPenalty, 0.005, SPREAD_BASE_MAX);
 }
 
 function appendPoint(series, point) {
@@ -213,12 +280,12 @@ export default function TrendSizingPage() {
   const [minMomentum, setMinMomentum] = useState(0);
   const [baseSize, setBaseSize] = useState(5);
   const [maxSize, setMaxSize] = useState(200);
-  const [sizeScale, setSizeScale] = useState(1);
+  const [sizeScale, setSizeScale] = useState(2);
   const [cooldownSec, setCooldownSec] = useState(5);
   const [hedgeEnabled, setHedgeEnabled] = useState(true);
-  const [hedgeRatioMin, setHedgeRatioMin] = useState(1.5);
-  const [hedgeRatioMax, setHedgeRatioMax] = useState(8);
-  const [hedgeSizeMult, setHedgeSizeMult] = useState(1);
+  const [hedgeRatioMin, setHedgeRatioMin] = useState(2.5);
+  const [hedgeRatioMax, setHedgeRatioMax] = useState(4);
+  const [hedgeSizeMult, setHedgeSizeMult] = useState(0.7);
   const [winnerBuyMinPrice, setWinnerBuyMinPrice] = useState(0.8);
   const [winnerBuyRequireFavored, setWinnerBuyRequireFavored] = useState(true);
   const [endClampLoserBuySec, setEndClampLoserBuySec] = useState(DEFAULT_END_CLAMP_SEC);
@@ -254,6 +321,53 @@ export default function TrendSizingPage() {
   const upAsk = activeBbo?.up?.ask ?? null;
   const downBid = activeBbo?.down?.bid ?? null;
   const downAsk = activeBbo?.down?.ask ?? null;
+  const upMid = useMemo(() => midPrice(upBid, upAsk), [upBid, upAsk]);
+  const downMid = useMemo(() => midPrice(downBid, downAsk), [downBid, downAsk]);
+  const upSpread = Number.isFinite(upAsk) && Number.isFinite(upBid) ? upAsk - upBid : null;
+  const downSpread = Number.isFinite(downAsk) && Number.isFinite(downBid) ? downAsk - downBid : null;
+
+  const windowDurationSec = useMemo(() => {
+    const start = meta?.polymarket?.marketStartTime;
+    const end = meta?.polymarket?.marketEndTime;
+    if (!start || !end) return null;
+    const duration = (new Date(end).getTime() - new Date(start).getTime()) / 1000;
+    return Number.isFinite(duration) && duration > 0 ? duration : null;
+  }, [meta?.polymarket?.marketStartTime, meta?.polymarket?.marketEndTime]);
+
+  const timeFrac = useMemo(() => {
+    if (!Number.isFinite(timeLeftSec) || !Number.isFinite(windowDurationSec)) return null;
+    return clamp(timeLeftSec / windowDurationSec, 0, 1);
+  }, [timeLeftSec, windowDurationSec]);
+
+  const upVolScore = useMemo(() => impliedVolScore(upMid, timeLeftSec), [upMid, timeLeftSec]);
+  const downVolScore = useMemo(() => impliedVolScore(downMid, timeLeftSec), [downMid, timeLeftSec]);
+  const volScore = useMemo(() => {
+    const scores = [upVolScore, downVolScore].filter((v) => Number.isFinite(v));
+    if (!scores.length) return null;
+    return Math.max(...scores);
+  }, [upVolScore, downVolScore]);
+
+  const ratioTighten = 1
+    + (Number.isFinite(volScore) ? volScore * VOL_RATIO_TIGHTEN : 0)
+    + (Number.isFinite(timeFrac) ? (1 - timeFrac) * TIME_RATIO_TIGHTEN : 0);
+  const buyRatioMinAdj = buyRatioMin * ratioTighten;
+  const sellRatioMinAdj = sellRatioMin * ratioTighten;
+  const minMomentumAdj = Math.max(0, minMomentum
+    + (Number.isFinite(volScore) ? volScore * VOL_MOMENTUM_BUMP : 0)
+    + (Number.isFinite(timeFrac) ? (1 - timeFrac) * TIME_MOMENTUM_BUMP : 0));
+  const sizeAdjust = useMemo(() => {
+    let adjust = 1;
+    if (Number.isFinite(volScore)) {
+      adjust *= Math.max(0.35, 1 - volScore * VOL_SIZE_DAMP);
+    }
+    if (Number.isFinite(timeFrac)) {
+      adjust *= Math.max(TIME_SIZE_DAMP_MIN, TIME_SIZE_DAMP_MIN + timeFrac * (1 - TIME_SIZE_DAMP_MIN));
+    }
+    return adjust;
+  }, [volScore, timeFrac]);
+
+  const upSpreadLimit = useMemo(() => computeSpreadLimit(timeFrac, upVolScore), [timeFrac, upVolScore]);
+  const downSpreadLimit = useMemo(() => computeSpreadLimit(timeFrac, downVolScore), [timeFrac, downVolScore]);
 
   const upBuyRatio = useMemo(() => buyPayoutRatio(upAsk), [upAsk]);
   const upSellRatio = useMemo(() => sellPayoutRatio(upBid), [upBid]);
@@ -438,9 +552,9 @@ export default function TrendSizingPage() {
     if (!simEnabled) return;
 
     const sizeFromRatio = (ratio, threshold, side, outcome) => {
-      if (!Number.isFinite(ratio) || !Number.isFinite(threshold) || threshold <= 0) return baseSize;
+      if (!Number.isFinite(ratio) || !Number.isFinite(threshold) || threshold <= 0) return baseSize * sizeAdjust;
       const multiplier = Math.max(1, ratio / threshold);
-      const sized = baseSize * Math.pow(multiplier, sizeScale);
+      const sized = baseSize * sizeAdjust * Math.pow(multiplier, sizeScale);
       const capped = Math.min(maxSize, Math.max(0, sized));
       if (side === "SELL") {
         const available = positionsRef.current[outcome] ?? 0;
@@ -460,6 +574,8 @@ export default function TrendSizingPage() {
     const requireFavoredPrimaryBuys = true;
     const inLoserBuyClamp = Number.isFinite(nextTimeLeft) && nextTimeLeft <= endClampLoserBuySec;
     const inWinnerHold = Number.isFinite(nextTimeLeft) && nextTimeLeft <= endClampWinnerSellSec;
+    const upSpreadOk = Number.isFinite(upSpread) && upSpread <= upSpreadLimit;
+    const downSpreadOk = Number.isFinite(downSpread) && downSpread <= downSpreadLimit;
 
     const recordTrade = ({ outcome, side, price, ratio, momentum, threshold, reason, isHedge = false, hedgeOf = null, sizeOverride = null }) => {
       const size = sizeOverride ?? sizeFromRatio(ratio, threshold, side, outcome);
@@ -523,8 +639,9 @@ export default function TrendSizingPage() {
         price: upAsk,
         ratio: upBuyRatio,
         momentum: computeMomentum(next.upBuy, momentumWindowSec),
-        threshold: buyRatioMin,
-        minMomentum
+        threshold: buyRatioMinAdj,
+        minMomentum: minMomentumAdj,
+        spreadOk: upSpreadOk
       },
       {
         key: "up-sell",
@@ -534,8 +651,9 @@ export default function TrendSizingPage() {
         price: upBid,
         ratio: upSellRatio,
         momentum: computeMomentum(next.upSell, momentumWindowSec),
-        threshold: sellRatioMin,
-        minMomentum
+        threshold: sellRatioMinAdj,
+        minMomentum: minMomentumAdj,
+        spreadOk: upSpreadOk
       },
       {
         key: "down-buy",
@@ -545,8 +663,9 @@ export default function TrendSizingPage() {
         price: downAsk,
         ratio: downBuyRatio,
         momentum: computeMomentum(next.downBuy, momentumWindowSec),
-        threshold: buyRatioMin,
-        minMomentum
+        threshold: buyRatioMinAdj,
+        minMomentum: minMomentumAdj,
+        spreadOk: downSpreadOk
       },
       {
         key: "down-sell",
@@ -556,8 +675,9 @@ export default function TrendSizingPage() {
         price: downBid,
         ratio: downSellRatio,
         momentum: computeMomentum(next.downSell, momentumWindowSec),
-        threshold: sellRatioMin,
-        minMomentum
+        threshold: sellRatioMinAdj,
+        minMomentum: minMomentumAdj,
+        spreadOk: downSpreadOk
       }
     ];
 
@@ -565,6 +685,7 @@ export default function TrendSizingPage() {
     for (const signal of signals) {
       if (!signal.enabled) continue;
       if (!Number.isFinite(signal.price) || !Number.isFinite(signal.ratio)) continue;
+      if (!signal.spreadOk) continue;
       if (signal.side === "BUY" && (signal.price >= MAX_BUY_PRICE || signal.price < MIN_BUY_PRICE)) continue;
       if (signal.side === "BUY" && requireFavoredPrimaryBuys && favoredOutcome && signal.outcome !== favoredOutcome) continue;
       if (signal.side === "SELL" && (positionsRef.current[signal.outcome] ?? 0) <= 0) continue;
@@ -612,6 +733,8 @@ export default function TrendSizingPage() {
         : computeMomentum(next.downBuy, momentumWindowSec);
 
       if (!Number.isFinite(hedgePrice) || !Number.isFinite(hedgeRatio)) continue;
+      const hedgeSpreadOk = hedgeOutcome === "Up" ? upSpreadOk : downSpreadOk;
+      if (!hedgeSpreadOk) continue;
       if (inLoserBuyClamp && favoredOutcome && hedgeOutcome !== favoredOutcome) continue;
       if (hedgePrice >= MAX_BUY_PRICE || hedgePrice < MIN_BUY_PRICE) continue;
       if (hedgeRatioMax < hedgeRatioMin) continue;
@@ -641,13 +764,14 @@ export default function TrendSizingPage() {
     downBuyRatio,
     downSellRatio,
     simEnabled,
-    buyRatioMin,
-    sellRatioMin,
-    minMomentum,
+    buyRatioMinAdj,
+    sellRatioMinAdj,
+    minMomentumAdj,
     momentumWindowSec,
     baseSize,
     maxSize,
     sizeScale,
+    sizeAdjust,
     cooldownSec,
     hedgeEnabled,
     hedgeRatioMin,
@@ -661,6 +785,10 @@ export default function TrendSizingPage() {
     enableUpSell,
     enableDownBuy,
     enableDownSell,
+    upSpread,
+    downSpread,
+    upSpreadLimit,
+    downSpreadLimit,
     activeAsset
   ]);
 
@@ -703,7 +831,7 @@ export default function TrendSizingPage() {
   const calcSizePreview = (ratio, threshold, side, outcome) => {
     if (!Number.isFinite(ratio) || !Number.isFinite(threshold) || threshold <= 0) return 0;
     const multiplier = Math.max(1, ratio / threshold);
-    const sized = Math.min(maxSize, baseSize * Math.pow(multiplier, sizeScale));
+    const sized = Math.min(maxSize, baseSize * sizeAdjust * Math.pow(multiplier, sizeScale));
     if (side === "SELL") {
       const available = positions[outcome] ?? 0;
       return Math.max(0, Math.min(sized, available));
@@ -816,6 +944,22 @@ export default function TrendSizingPage() {
                     <div className="tradeHistoryRow">
                       <span>Down Buy/Sell Ratio</span>
                       <span className="mono">{fmtRatio(downBuyRatio, 2)} / {fmtRatio(downSellRatio, 2)}</span>
+                    </div>
+                    <div className="tradeHistoryRow">
+                      <span>Vol Score (Up/Down)</span>
+                      <span className="mono">{fmtNum(upVolScore, 4)} / {fmtNum(downVolScore, 4)}</span>
+                    </div>
+                    <div className="tradeHistoryRow">
+                      <span>Time Factor</span>
+                      <span className="mono">{timeFrac === null ? "-" : `${fmtNum(timeFrac * 100, 0)}%`}</span>
+                    </div>
+                    <div className="tradeHistoryRow">
+                      <span>Spread (Up/Down)</span>
+                      <span className="mono">{fmtUsd(upSpread, 3)} / {fmtUsd(downSpread, 3)}</span>
+                    </div>
+                    <div className="tradeHistoryRow">
+                      <span>Spread Max (Up/Down)</span>
+                      <span className="mono">{fmtUsd(upSpreadLimit, 3)} / {fmtUsd(downSpreadLimit, 3)}</span>
                     </div>
                   </div>
                 </div>
@@ -957,7 +1101,7 @@ export default function TrendSizingPage() {
           <div className="cardBody">
             <div className="tradeControls">
               <div className="tradeControl">
-                <div className="tradeControlLabel">Buy Ratio Min {tooltip("Minimum buy payout ratio required to allow BUY signals. Buy ratio = (1 - ask) / ask. If below, BUY is blocked unless Winner Buy Gate passes.")}</div>
+                <div className="tradeControlLabel">Buy Ratio Min {tooltip("Minimum buy payout ratio required to allow BUY signals. Buy ratio = (1 - ask) / ask. If below, BUY is blocked unless Winner Buy Gate passes. Adjusted upward as time-to-expiry shrinks and implied vol rises.")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -999,7 +1143,7 @@ export default function TrendSizingPage() {
                 />
               </div>
               <div className="tradeControl">
-                <div className="tradeControlLabel">Min Momentum / s {tooltip("Minimum ratio slope per second required to allow a signal.")}</div>
+                <div className="tradeControlLabel">Min Momentum / s {tooltip("Minimum ratio slope per second required to allow a signal. Adjusted upward as time-to-expiry shrinks and implied vol rises.")}</div>
                 <input
                   className="tradeInput"
                   type="number"
@@ -1210,19 +1354,19 @@ export default function TrendSizingPage() {
               <div className="cardTitle" style={{ marginBottom: 8 }}>Derived Sizing</div>
               <div className="kv">
                 <div className="k">Up Buy Size</div>
-                <div className="v mono">{fmtNum(calcSizePreview(upBuyRatio, buyRatioMin, "BUY", "Up"), 2)}</div>
+                <div className="v mono">{fmtNum(calcSizePreview(upBuyRatio, buyRatioMinAdj, "BUY", "Up"), 2)}</div>
               </div>
               <div className="kv">
                 <div className="k">Up Sell Size</div>
-                <div className="v mono">{fmtNum(calcSizePreview(upSellRatio, sellRatioMin, "SELL", "Up"), 2)}</div>
+                <div className="v mono">{fmtNum(calcSizePreview(upSellRatio, sellRatioMinAdj, "SELL", "Up"), 2)}</div>
               </div>
               <div className="kv">
                 <div className="k">Down Buy Size</div>
-                <div className="v mono">{fmtNum(calcSizePreview(downBuyRatio, buyRatioMin, "BUY", "Down"), 2)}</div>
+                <div className="v mono">{fmtNum(calcSizePreview(downBuyRatio, buyRatioMinAdj, "BUY", "Down"), 2)}</div>
               </div>
               <div className="kv">
                 <div className="k">Down Sell Size</div>
-                <div className="v mono">{fmtNum(calcSizePreview(downSellRatio, sellRatioMin, "SELL", "Down"), 2)}</div>
+                <div className="v mono">{fmtNum(calcSizePreview(downSellRatio, sellRatioMinAdj, "SELL", "Down"), 2)}</div>
               </div>
             </div>
           </div>
