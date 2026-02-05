@@ -216,8 +216,8 @@ export default function TrendSizingPage() {
   const [sizeScale, setSizeScale] = useState(1);
   const [cooldownSec, setCooldownSec] = useState(5);
   const [hedgeEnabled, setHedgeEnabled] = useState(true);
-  const [hedgeRatioMin, setHedgeRatioMin] = useState(0);
-  const [hedgeRatioMax, setHedgeRatioMax] = useState(1);
+  const [hedgeRatioMin, setHedgeRatioMin] = useState(1.5);
+  const [hedgeRatioMax, setHedgeRatioMax] = useState(8);
   const [hedgeSizeMult, setHedgeSizeMult] = useState(1);
   const [winnerBuyMinPrice, setWinnerBuyMinPrice] = useState(0.8);
   const [winnerBuyRequireFavored, setWinnerBuyRequireFavored] = useState(true);
@@ -455,6 +455,7 @@ export default function TrendSizingPage() {
     const favoredOutcome = Number.isFinite(upAsk) && Number.isFinite(downAsk)
       ? (upAsk >= downAsk ? "Up" : "Down")
       : null;
+    const requireFavoredPrimaryBuys = true;
     const inLoserBuyClamp = Number.isFinite(nextTimeLeft) && nextTimeLeft <= endClampLoserBuySec;
     const inWinnerHold = Number.isFinite(nextTimeLeft) && nextTimeLeft <= endClampWinnerSellSec;
 
@@ -551,6 +552,7 @@ export default function TrendSizingPage() {
       if (!signal.enabled) continue;
       if (!Number.isFinite(signal.price) || !Number.isFinite(signal.ratio)) continue;
       if (signal.side === "BUY" && (signal.price >= MAX_BUY_PRICE || signal.price < MIN_BUY_PRICE)) continue;
+      if (signal.side === "BUY" && requireFavoredPrimaryBuys && favoredOutcome && signal.outcome !== favoredOutcome) continue;
       if (signal.side === "SELL" && (positionsRef.current[signal.outcome] ?? 0) <= 0) continue;
       if (signal.side === "BUY" && inLoserBuyClamp && favoredOutcome && signal.outcome !== favoredOutcome) continue;
       if (signal.side === "SELL" && inWinnerHold && favoredOutcome && signal.outcome === favoredOutcome) continue;
