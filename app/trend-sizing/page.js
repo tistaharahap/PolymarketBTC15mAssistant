@@ -290,7 +290,7 @@ export default function TrendSizingPage() {
   const [winnerBuyRequireFavored, setWinnerBuyRequireFavored] = useState(true);
   const [endClampLoserBuySec, setEndClampLoserBuySec] = useState(DEFAULT_END_CLAMP_SEC);
   const [endClampWinnerSellSec, setEndClampWinnerSellSec] = useState(DEFAULT_END_CLAMP_SEC);
-  const [settlementBuffer, setSettlementBuffer] = useState(0);
+  const [settlementBuffer, setSettlementBuffer] = useState(5);
   const [settlementCapMult, setSettlementCapMult] = useState(0.95);
   const [rebalanceMode, setRebalanceMode] = useState("sell-first");
   const [maxRebalanceSizeMult, setMaxRebalanceSizeMult] = useState(1);
