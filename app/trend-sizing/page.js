@@ -15,6 +15,17 @@ const RATIO_POINTS_LIMIT = 1200;
 const MAX_BUY_PRICE = 0.99;
 const MIN_BUY_PRICE = 0.01;
 const DEFAULT_END_CLAMP_SEC = 120;
+const LIVE_FILL_WAIT_MS = 60000;
+const LIVE_FILL_POLL_MS = 1500;
+const LIVE_RECONCILE_MS = 15000;
+const LIVE_MIN_SHARES = 5;
+const LIVE_MIN_NOTIONAL_USD = 1;
+const LIVE_RETRY_BACKOFF_MS = 2500;
+const LIVE_RETRY_BACKOFF_COLLATERAL_MS = 10000;
+const LIVE_RETRY_BACKOFF_CONDITIONAL_MS = 6000;
+const LIVE_RETRY_BACKOFF_FAK_NO_MATCH_MS = 4000;
+const LIVE_RETRY_BACKOFF_INVALID_PRICE_MS = 15000;
+const NUMERIC_EPSILON = 1e-9;
 const SQRT_TWO_PI = Math.sqrt(2 * Math.PI);
 const VOL_TIME_SCALE_SEC = 60;
 const VOL_RATIO_TIGHTEN = 1.0;
@@ -49,6 +60,90 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function isBelowMin(value, min, epsilon = NUMERIC_EPSILON) {
+  return !Number.isFinite(value) || value + epsilon < min;
+}
+
+function isFakNoMatchError(errorText) {
+  return String(errorText ?? "").toLowerCase().includes("no orders found to match with fak order");
+}
+
+function isInsufficientBalanceAllowanceError(errorText) {
+  return String(errorText ?? "").toLowerCase().includes("not enough balance / allowance");
+}
+
+function isPriceOutOfTradableRange(price) {
+  return isBelowMin(price, MIN_BUY_PRICE) || price > (MAX_BUY_PRICE + NUMERIC_EPSILON);
+}
+
+function isPriceOutOfRangeError(errorText) {
+  return String(errorText ?? "").toLowerCase().includes("price out of tradable range");
+}
+
+function roundTo(value, decimals = 2) {
+  if (!Number.isFinite(value)) return value;
+  const factor = 10 ** decimals;
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+}
+
+function floorTo(value, decimals = 2) {
+  if (!Number.isFinite(value)) return value;
+  const factor = 10 ** decimals;
+  return Math.floor((value + 1e-9) * factor) / factor;
+}
+
+function ceilTo(value, decimals = 2) {
+  if (!Number.isFinite(value)) return value;
+  const factor = 10 ** decimals;
+  return Math.ceil((value - 1e-9) * factor) / factor;
+}
+
+function normalizeTradeSize({
+  rawSize,
+  side,
+  price,
+  maxSize = Number.POSITIVE_INFINITY,
+  available = Number.POSITIVE_INFINITY,
+  minShares = LIVE_MIN_SHARES,
+  minNotional = LIVE_MIN_NOTIONAL_USD
+}) {
+  let size = Number(rawSize);
+  if (!Number.isFinite(size) || size <= 0) return 0;
+
+  const px = Number(price);
+  const hasPx = Number.isFinite(px) && px > 0;
+  const maxAllowed = Number.isFinite(maxSize) ? Math.max(0, maxSize) : Number.POSITIVE_INFINITY;
+  const availAllowed = Number.isFinite(available) ? Math.max(0, available) : Number.POSITIVE_INFINITY;
+  const minSharesFromNotional = hasPx ? ceilTo(minNotional / px, 2) : minShares;
+  const hardMinShares = Math.max(minShares, minSharesFromNotional);
+
+  if (side === "SELL") {
+    if (isBelowMin(availAllowed, hardMinShares)) return 0;
+    size = Math.max(size, hardMinShares);
+    size = Math.min(size, availAllowed);
+    const remaining = availAllowed - size;
+    if (remaining > NUMERIC_EPSILON && isBelowMin(remaining, hardMinShares)) {
+      // Avoid leaving an unsellable residual position (e.g. 7 -> 5 + 2).
+      size = availAllowed;
+    }
+    if (isBelowMin(size, minShares)) return 0;
+  } else {
+    size = Math.max(size, hardMinShares);
+  }
+
+  size = Math.min(size, maxAllowed);
+  if (side === "SELL") {
+    const remainingAfterCap = availAllowed - size;
+    if (remainingAfterCap > NUMERIC_EPSILON && isBelowMin(remainingAfterCap, hardMinShares)) {
+      size = availAllowed;
+    }
+  }
+  if (isBelowMin(size, minShares)) return 0;
+  if (hasPx && isBelowMin(size * px, minNotional)) return 0;
+
+  return roundTo(Math.max(size, minShares), 2);
+}
+
 function tooltip(text) {
   return (
     <span className="tooltip" aria-label={text} data-tip={text}>
@@ -63,6 +158,82 @@ function fmtTimeLeftSec(value) {
   const m = Math.floor(total / 60);
   const s = total % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function computeTradeStats(entries) {
+  const stats = {
+    events: 0,
+    liveEvents: 0,
+    apiAttempts: 0,
+    liveApiAttempts: 0,
+    filled: 0,
+    liveFilled: 0,
+    failedApi: 0,
+    liveFailedApi: 0,
+    skipped: 0,
+    liveSkipped: 0
+  };
+  if (!Array.isArray(entries) || !entries.length) return stats;
+  for (const entry of entries) {
+    if (!entry) continue;
+    stats.events += 1;
+    const isLive = entry.mode === "live";
+    if (isLive) stats.liveEvents += 1;
+    const size = Number(entry.size);
+    const status = String(entry.status ?? "").toLowerCase();
+    const apiAttempted = Boolean(
+      entry.apiAttempted === true
+      || (isLive && (entry.orderId || status === "filled" || status === "partial" || status === "no-fill"))
+    );
+    const isFilled = (status === "filled" || status === "partial" || status === "sim") && size > 0;
+    const isApiFailed = apiAttempted && (status === "error" || status === "no-fill" || status === "rejected");
+    const isSkipped = !apiAttempted && (status === "skipped" || status === "blocked" || status === "error");
+    if (apiAttempted) {
+      stats.apiAttempts += 1;
+      if (isLive) stats.liveApiAttempts += 1;
+    }
+    if (isFilled) {
+      stats.filled += 1;
+      if (isLive) stats.liveFilled += 1;
+    }
+    if (isApiFailed) {
+      stats.failedApi += 1;
+      if (isLive) stats.liveFailedApi += 1;
+    }
+    if (isSkipped) {
+      stats.skipped += 1;
+      if (isLive) stats.liveSkipped += 1;
+    }
+  }
+  return stats;
+}
+
+function computeSkippedReasonCounts(entries, { liveOnly = true } = {}) {
+  const counts = {};
+  if (!Array.isArray(entries) || !entries.length) return counts;
+  for (const entry of entries) {
+    if (!entry) continue;
+    if (liveOnly && entry.mode !== "live") continue;
+    const status = String(entry.status ?? "").toLowerCase();
+    if (status !== "skipped" && status !== "blocked") continue;
+    const reason = String(entry.reason ?? "").trim() || "unspecified";
+    counts[reason] = (counts[reason] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function mergeReasonCounts(base, extra) {
+  const merged = { ...(base ?? {}) };
+  const source = extra ?? {};
+  for (const [reason, count] of Object.entries(source)) {
+    merged[reason] = (merged[reason] ?? 0) + (Number(count) || 0);
+  }
+  return merged;
+}
+
+function reasonCountsToRows(counts) {
+  return Object.entries(counts ?? {})
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
 function buyPayoutRatio(price) {
@@ -273,7 +444,10 @@ export default function TrendSizingPage() {
   const [clobByAsset, setClobByAsset] = useState({});
   const clobRef = useRef(null);
 
-  const [simEnabled, setSimEnabled] = useState(true);
+  const [liveAllowed, setLiveAllowed] = useState(false);
+  const [tradeActive, setTradeActive] = useState(false);
+  const [tradeArmed, setTradeArmed] = useState(false);
+  const [tradeNotice, setTradeNotice] = useState(null);
   const [buyRatioMin, setBuyRatioMin] = useState(8);
   const [sellRatioMin, setSellRatioMin] = useState(20);
   const [momentumWindowSec, setMomentumWindowSec] = useState(15);
@@ -317,6 +491,11 @@ export default function TrendSizingPage() {
   const lastTradeRef = useRef({});
   const [windowHistory, setWindowHistory] = useState([]);
   const lastWindowRef = useRef({ slug: null, start: null, end: null, asset: null });
+  const tradeStartTimerRef = useRef(null);
+  const liveOrderBusyRef = useRef(false);
+  const liveReconcileBusyRef = useRef(false);
+  const liveRetryAfterRef = useRef(0);
+  const liveNoMatchRetryByOrderRef = useRef({});
   const lastWinnerSideRef = useRef(null);
   const positionsRef = useRef({ Up: 0, Down: 0 });
   const [positions, setPositions] = useState({ Up: 0, Down: 0 });
@@ -325,6 +504,7 @@ export default function TrendSizingPage() {
   const [positionNotional, setPositionNotional] = useState({ Up: 0, Down: 0 });
   const cashFlowRef = useRef({ spent: 0, received: 0 });
   const [cashFlow, setCashFlow] = useState({ spent: 0, received: 0 });
+  const [lastSyncTs, setLastSyncTs] = useState(null);
   const lastBboRef = useRef({ upBid: null, downBid: null });
   const [timeLeftSec, setTimeLeftSec] = useState(null);
   const timeLeftRef = useRef(null);
@@ -428,6 +608,28 @@ export default function TrendSizingPage() {
   }, [ratioSeries]);
 
   useEffect(() => {
+    let alive = true;
+    async function initTrading() {
+      try {
+        const res = await fetch("/api/trade/init", { cache: "no-store" });
+        if (!alive) return;
+        if (!res.ok) {
+          setLiveAllowed(false);
+          return;
+        }
+        setLiveAllowed(true);
+      } catch {
+        if (!alive) return;
+        setLiveAllowed(false);
+      }
+    }
+    initTrading();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!activeMarketSlug) return;
     const prev = lastWindowRef.current?.slug;
     if (prev && prev !== activeMarketSlug) {
@@ -438,6 +640,11 @@ export default function TrendSizingPage() {
         asset: lastWindowRef.current?.asset
       });
       resetSim();
+      if (tradeArmed) {
+        setTradeActive(true);
+        setTradeArmed(false);
+        setTradeNotice(null);
+      }
     }
     lastWindowRef.current = {
       slug: activeMarketSlug,
@@ -445,12 +652,93 @@ export default function TrendSizingPage() {
       end: meta?.polymarket?.marketEndTime ?? null,
       asset: activeAsset
     };
-  }, [activeMarketSlug, meta?.polymarket?.marketStartTime, meta?.polymarket?.marketEndTime, activeAsset]);
+  }, [activeMarketSlug, meta?.polymarket?.marketStartTime, meta?.polymarket?.marketEndTime, activeAsset, tradeArmed]);
 
   useEffect(() => {
     if (Number.isFinite(upBid)) lastBboRef.current.upBid = upBid;
     if (Number.isFinite(downBid)) lastBboRef.current.downBid = downBid;
   }, [upBid, downBid]);
+
+  useEffect(() => {
+    if (!liveAllowed || !tradeActive) return;
+    const upTokenId = activeTokens?.upTokenId ?? null;
+    const downTokenId = activeTokens?.downTokenId ?? null;
+    if (!upTokenId || !downTokenId) return;
+
+    let canceled = false;
+    let timeoutId = null;
+
+    const isVisible = () => typeof document === "undefined" || document.visibilityState === "visible";
+
+    const reconcileOnce = async () => {
+      if (canceled || liveReconcileBusyRef.current || !isVisible()) return;
+      liveReconcileBusyRef.current = true;
+      try {
+        const [upRes, downRes] = await Promise.all([
+          fetch(`/api/trade/balance?tokenId=${encodeURIComponent(upTokenId)}`, { cache: "no-store" }),
+          fetch(`/api/trade/balance?tokenId=${encodeURIComponent(downTokenId)}`, { cache: "no-store" })
+        ]);
+        if (!upRes.ok || !downRes.ok) return;
+        const [upData, downData] = await Promise.all([
+          upRes.json().catch(() => ({})),
+          downRes.json().catch(() => ({}))
+        ]);
+        const upAvailable = Number(upData?.available);
+        const downAvailable = Number(downData?.available);
+        if (!Number.isFinite(upAvailable) || !Number.isFinite(downAvailable)) return;
+        if (canceled) return;
+        setLastSyncTs(Date.now());
+      } catch {
+        // Best-effort reconciliation; ignore transient transport errors.
+      } finally {
+        liveReconcileBusyRef.current = false;
+      }
+    };
+
+    const scheduleNext = () => {
+      if (canceled) return;
+      timeoutId = setTimeout(async () => {
+        await reconcileOnce();
+        scheduleNext();
+      }, LIVE_RECONCILE_MS);
+    };
+
+    const onVisibilityChange = () => {
+      if (!canceled && isVisible()) void reconcileOnce();
+    };
+
+    void reconcileOnce();
+    scheduleNext();
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+
+    return () => {
+      canceled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+    };
+  }, [liveAllowed, tradeActive, activeTokens?.upTokenId, activeTokens?.downTokenId]);
+
+  useEffect(() => {
+    if (!tradeArmed) return;
+    const startMs = meta?.polymarket?.marketStartTime ? new Date(meta.polymarket.marketStartTime).getTime() : null;
+    if (!Number.isFinite(startMs)) return;
+    const now = Date.now();
+    if (now >= startMs) return;
+    if (tradeStartTimerRef.current) clearTimeout(tradeStartTimerRef.current);
+    tradeStartTimerRef.current = setTimeout(() => {
+      setTradeActive(true);
+      setTradeArmed(false);
+      setTradeNotice(null);
+    }, Math.max(0, startMs - now));
+    return () => {
+      if (tradeStartTimerRef.current) clearTimeout(tradeStartTimerRef.current);
+      tradeStartTimerRef.current = null;
+    };
+  }, [tradeArmed, meta?.polymarket?.marketStartTime]);
 
   const recordWindow = ({ slug, startTime, endTime, asset }) => {
     const upMark = Number.isFinite(lastBboRef.current.upBid) ? lastBboRef.current.upBid : null;
@@ -463,6 +751,8 @@ export default function TrendSizingPage() {
     const netSpent = (cashFlowRef.current.spent ?? 0) - (cashFlowRef.current.received ?? 0);
     const settlementPnl = winner ? winnerShares - netSpent : null;
 
+    const windowTradeStats = computeTradeStats(trades);
+    const windowSkippedReasonCounts = computeSkippedReasonCounts(trades, { liveOnly: true });
     const entry = {
       id: `${slug ?? "window"}-${Date.now()}`,
       ts: Date.now(),
@@ -480,7 +770,9 @@ export default function TrendSizingPage() {
       settlement: { winner, winnerShares, pnl: settlementPnl, netSpent },
       cashFlow: { ...cashFlowRef.current, netSpent },
       marks: { up: upMark, down: downMark },
-      trades: trades.length
+      trades: windowTradeStats.events,
+      tradeStats: windowTradeStats,
+      skippedReasonCounts: windowSkippedReasonCounts
     };
 
     setWindowHistory((prev) => [entry, ...prev].slice(0, 200));
@@ -593,23 +885,38 @@ export default function TrendSizingPage() {
     ratioSeriesRef.current = next;
     setRatioSeries(next);
 
-    if (!simEnabled) return;
+    if (!tradeActive) return;
+    if (liveAllowed && liveOrderBusyRef.current) return;
 
     const sizeFromRatio = (ratio, threshold, side, outcome) => {
       const dojiMult = side === "BUY"
         ? (dojiActive ? (dojiAllowBuys ? dojiSizeMult : 0) : 1)
         : 1;
       if (!Number.isFinite(ratio) || !Number.isFinite(threshold) || threshold <= 0) {
-        return baseSize * sizeAdjust * dojiMult;
+        const fallbackSize = baseSize * sizeAdjust * dojiMult;
+        const fallbackPrice = side === "BUY"
+          ? (outcome === "Up" ? upAsk : downAsk)
+          : (outcome === "Up" ? upBid : downBid);
+        return normalizeTradeSize({
+          rawSize: fallbackSize,
+          side,
+          price: fallbackPrice,
+          maxSize,
+          available: positionsRef.current[outcome] ?? 0
+        });
       }
       const multiplier = Math.max(1, ratio / threshold);
       const sized = baseSize * sizeAdjust * dojiMult * Math.pow(multiplier, sizeScale);
-      const capped = Math.min(maxSize, Math.max(0, sized));
-      if (side === "SELL") {
-        const available = positionsRef.current[outcome] ?? 0;
-        return Math.max(0, Math.min(capped, available));
-      }
-      return capped;
+      const tradePrice = side === "BUY"
+        ? (outcome === "Up" ? upAsk : downAsk)
+        : (outcome === "Up" ? upBid : downBid);
+      return normalizeTradeSize({
+        rawSize: sized,
+        side,
+        price: tradePrice,
+        maxSize,
+        available: positionsRef.current[outcome] ?? 0
+      });
     };
 
     const shouldTrade = (key) => {
@@ -626,37 +933,63 @@ export default function TrendSizingPage() {
     const upSpreadOk = Number.isFinite(upSpread) && upSpread <= upSpreadLimit;
     const downSpreadOk = Number.isFinite(downSpread) && downSpread <= downSpreadLimit;
 
-    const recordTrade = ({ outcome, side, price, ratio, momentum, threshold, reason, isHedge = false, hedgeOf = null, sizeOverride = null }) => {
-      const size = sizeOverride ?? sizeFromRatio(ratio, threshold, side, outcome);
-      if (!Number.isFinite(size) || size <= 0) return;
-      const notional = size * price;
+    const recordTrade = ({
+      outcome,
+      side,
+      price,
+      ratio,
+      momentum,
+      threshold,
+      reason,
+      isHedge = false,
+      hedgeOf = null,
+      sizeOverride = null,
+      requestedSize = null,
+      filledSize = null,
+      avgPrice = null,
+      status = "filled",
+      mode = "sim",
+      orderId = null,
+      apiAttempted = false
+    }) => {
+      const desiredSize = requestedSize ?? sizeOverride ?? sizeFromRatio(ratio, threshold, side, outcome);
+      const tradePrice = Number.isFinite(avgPrice) ? avgPrice : price;
+      const size = Number.isFinite(filledSize) ? filledSize : desiredSize;
+      const applyFill = Number.isFinite(size) && size > 0 && Number.isFinite(tradePrice);
+      const notional = applyFill ? size * tradePrice : 0;
       const prevPos = positionsRef.current[outcome] ?? 0;
       const prevAvg = avgCostRef.current[outcome] ?? 0;
-      const nextPosValue = side === "BUY" ? prevPos + size : Math.max(0, prevPos - size);
-      const nextAvg = side === "BUY"
-        ? (nextPosValue > 0 ? ((prevAvg * prevPos) + (price * size)) / nextPosValue : 0)
-        : (nextPosValue > 0 ? prevAvg : 0);
-      const nextPos = { ...positionsRef.current, [outcome]: nextPosValue };
-      const nextAvgMap = { ...avgCostRef.current, [outcome]: nextAvg };
-      positionsRef.current = nextPos;
-      avgCostRef.current = nextAvgMap;
-      setPositions(nextPos);
-      setAvgCost(nextAvgMap);
-      const nextCashFlow = side === "BUY"
-        ? {
-            spent: (cashFlowRef.current.spent ?? 0) + notional,
-            received: cashFlowRef.current.received ?? 0
-          }
-        : {
-            spent: cashFlowRef.current.spent ?? 0,
-            received: (cashFlowRef.current.received ?? 0) + notional
-          };
-      cashFlowRef.current = nextCashFlow;
-      setCashFlow(nextCashFlow);
-      setPositionNotional({
-        Up: (nextAvgMap.Up ?? 0) * (nextPos.Up ?? 0),
-        Down: (nextAvgMap.Down ?? 0) * (nextPos.Down ?? 0)
-      });
+      let nextPos = positionsRef.current;
+      let nextAvgMap = avgCostRef.current;
+
+      if (applyFill) {
+        const nextPosValue = side === "BUY" ? prevPos + size : Math.max(0, prevPos - size);
+        const nextAvg = side === "BUY"
+          ? (nextPosValue > 0 ? ((prevAvg * prevPos) + (tradePrice * size)) / nextPosValue : 0)
+          : (nextPosValue > 0 ? prevAvg : 0);
+        nextPos = { ...positionsRef.current, [outcome]: nextPosValue };
+        nextAvgMap = { ...avgCostRef.current, [outcome]: nextAvg };
+        positionsRef.current = nextPos;
+        avgCostRef.current = nextAvgMap;
+        setPositions(nextPos);
+        setAvgCost(nextAvgMap);
+        const nextCashFlow = side === "BUY"
+          ? {
+              spent: (cashFlowRef.current.spent ?? 0) + notional,
+              received: cashFlowRef.current.received ?? 0
+            }
+          : {
+              spent: cashFlowRef.current.spent ?? 0,
+              received: (cashFlowRef.current.received ?? 0) + notional
+            };
+        cashFlowRef.current = nextCashFlow;
+        setCashFlow(nextCashFlow);
+        setPositionNotional({
+          Up: (nextAvgMap.Up ?? 0) * (nextPos.Up ?? 0),
+          Down: (nextAvgMap.Down ?? 0) * (nextPos.Down ?? 0)
+        });
+      }
+
       const entry = {
         id: `${nowSec}-${outcome}-${side}-${Math.random().toString(36).slice(2, 7)}`,
         ts: Date.now(),
@@ -664,19 +997,289 @@ export default function TrendSizingPage() {
         asset: activeAsset,
         outcome,
         side,
-        price,
+        price: tradePrice,
         ratio,
         momentum,
-        size,
+        size: applyFill ? size : 0,
+        requestedSize: Number.isFinite(desiredSize) ? desiredSize : 0,
         notional,
         threshold,
         reason,
         positionAfter: nextPos[outcome],
         isHedge,
-        hedgeOf
+        hedgeOf,
+        status,
+        mode,
+        orderId,
+        apiAttempted
       };
       setTrades((prev) => [entry, ...prev].slice(0, 2000));
       return entry;
+    };
+
+    const executeTrade = async ({
+      outcome,
+      side,
+      price,
+      ratio,
+      momentum,
+      threshold,
+      reason,
+      isHedge = false,
+      hedgeOf = null,
+      sizeOverride = null
+    }) => {
+      const submitPrice = roundTo(price, 2);
+      const rawDesiredSize = sizeOverride ?? sizeFromRatio(ratio, threshold, side, outcome);
+      const desiredSize = normalizeTradeSize({
+        rawSize: rawDesiredSize,
+        side,
+        price: submitPrice,
+        maxSize,
+        available: positionsRef.current[outcome] ?? 0
+      });
+      if (!Number.isFinite(desiredSize) || desiredSize <= 0) return null;
+      const mode = liveAllowed ? "live" : "sim";
+
+      if (!liveAllowed) {
+        return recordTrade({
+          outcome,
+          side,
+          price,
+          ratio,
+          momentum,
+          threshold,
+          reason,
+          isHedge,
+          hedgeOf,
+          requestedSize: desiredSize,
+          filledSize: desiredSize,
+          avgPrice: price,
+          status: "sim",
+          mode,
+          apiAttempted: false
+        });
+      }
+
+      if (liveOrderBusyRef.current) return null;
+      const tokenId = outcome === "Up" ? activeTokens?.upTokenId : activeTokens?.downTokenId;
+      if (!tokenId) {
+        return recordTrade({
+          outcome,
+          side,
+          price,
+          ratio,
+          momentum,
+          threshold,
+          reason: `${reason} · missing tokenId`,
+          isHedge,
+          hedgeOf,
+          requestedSize: desiredSize,
+          filledSize: 0,
+          status: "skipped",
+          mode,
+          apiAttempted: false
+        });
+      }
+
+      const retryKey = `${tokenId}:${side}`;
+      const nowMs = Date.now();
+      if (nowMs < liveRetryAfterRef.current) return null;
+      const noMatchRetryAt = Number(liveNoMatchRetryByOrderRef.current[retryKey] ?? 0);
+      if (nowMs < noMatchRetryAt) return null;
+
+      liveOrderBusyRef.current = true;
+      try {
+        if (isPriceOutOfTradableRange(submitPrice)) {
+          const invalidPriceRetryAfter = Date.now() + LIVE_RETRY_BACKOFF_INVALID_PRICE_MS;
+          const prevRetry = Number(liveNoMatchRetryByOrderRef.current[retryKey] ?? 0);
+          liveNoMatchRetryByOrderRef.current[retryKey] = Math.max(prevRetry, invalidPriceRetryAfter);
+          return recordTrade({
+            outcome,
+            side,
+            price,
+            ratio,
+            momentum,
+            threshold,
+            reason: `${reason} · price out of tradable range ($${fmtNum(MIN_BUY_PRICE, 2)}-$${fmtNum(MAX_BUY_PRICE, 2)})`,
+            isHedge,
+            hedgeOf,
+            requestedSize: desiredSize,
+            filledSize: 0,
+            status: "skipped",
+            mode,
+            apiAttempted: false
+          });
+        }
+        const submitAmount = side === "BUY"
+          ? ceilTo(desiredSize * submitPrice, 2)
+          : floorTo(desiredSize, 2);
+        if (!Number.isFinite(submitPrice) || submitPrice <= 0 || !Number.isFinite(submitAmount) || submitAmount <= 0) {
+          return recordTrade({
+            outcome,
+            side,
+            price,
+            ratio,
+            momentum,
+            threshold,
+            reason: `${reason} · invalid amount`,
+            isHedge,
+            hedgeOf,
+            requestedSize: desiredSize,
+            filledSize: 0,
+            status: "skipped",
+            mode,
+            apiAttempted: false
+          });
+        }
+        if (side === "BUY" && isBelowMin(submitAmount, LIVE_MIN_NOTIONAL_USD)) {
+          return recordTrade({
+            outcome,
+            side,
+            price,
+            ratio,
+            momentum,
+            threshold,
+            reason: `${reason} · buy amount below $${LIVE_MIN_NOTIONAL_USD} minimum`,
+            isHedge,
+            hedgeOf,
+            requestedSize: desiredSize,
+            filledSize: 0,
+            status: "skipped",
+            mode,
+            apiAttempted: false
+          });
+        }
+        if (side === "SELL" && isBelowMin(submitAmount * submitPrice, LIVE_MIN_NOTIONAL_USD)) {
+          return recordTrade({
+            outcome,
+            side,
+            price,
+            ratio,
+            momentum,
+            threshold,
+            reason: `${reason} · sell notional below $${LIVE_MIN_NOTIONAL_USD} minimum`,
+            isHedge,
+            hedgeOf,
+            requestedSize: desiredSize,
+            filledSize: 0,
+            status: "skipped",
+            mode,
+            apiAttempted: false
+          });
+        }
+
+        const res = await fetch("/api/trade/limit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tokenId,
+            side,
+            price: submitPrice,
+            amount: submitAmount,
+            market: true,
+            orderType: "FAK",
+            postOnly: false,
+            awaitFill: true,
+            maxWaitMs: LIVE_FILL_WAIT_MS,
+            pollIntervalMs: LIVE_FILL_POLL_MS
+          })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const errorText = String(data?.error ?? "");
+          if (isFakNoMatchError(errorText)) {
+            const noMatchRetryAfter = Date.now() + LIVE_RETRY_BACKOFF_FAK_NO_MATCH_MS;
+            const prevRetry = Number(liveNoMatchRetryByOrderRef.current[retryKey] ?? 0);
+            liveNoMatchRetryByOrderRef.current[retryKey] = Math.max(prevRetry, noMatchRetryAfter);
+          }
+          if (isInsufficientBalanceAllowanceError(errorText)) {
+            const balanceBackoffMs = side === "BUY"
+              ? LIVE_RETRY_BACKOFF_COLLATERAL_MS
+              : LIVE_RETRY_BACKOFF_CONDITIONAL_MS;
+            liveRetryAfterRef.current = Math.max(liveRetryAfterRef.current, Date.now() + balanceBackoffMs);
+          }
+          if (isPriceOutOfRangeError(errorText)) {
+            const invalidPriceRetryAfter = Date.now() + LIVE_RETRY_BACKOFF_INVALID_PRICE_MS;
+            const prevRetry = Number(liveNoMatchRetryByOrderRef.current[retryKey] ?? 0);
+            liveNoMatchRetryByOrderRef.current[retryKey] = Math.max(prevRetry, invalidPriceRetryAfter);
+          }
+          const detailAssetType = String(data?.details?.availableAssetType ?? "").toUpperCase();
+          if (res.status === 409) {
+            let backoffMs = LIVE_RETRY_BACKOFF_MS;
+            if (detailAssetType === "COLLATERAL") backoffMs = LIVE_RETRY_BACKOFF_COLLATERAL_MS;
+            else if (detailAssetType === "CONDITIONAL") backoffMs = LIVE_RETRY_BACKOFF_CONDITIONAL_MS;
+            liveRetryAfterRef.current = Math.max(liveRetryAfterRef.current, Date.now() + backoffMs);
+          }
+          return recordTrade({
+            outcome,
+            side,
+            price,
+            ratio,
+            momentum,
+            threshold,
+            reason: `${reason} · ${data?.error ?? "order failed"}`,
+            isHedge,
+            hedgeOf,
+            requestedSize: desiredSize,
+            filledSize: 0,
+            status: "error",
+            mode,
+            orderId: data?.orderId ?? null,
+            apiAttempted: true
+          });
+        }
+        const orderId = data?.orderId ?? null;
+        const apiFilledSize = Number(data?.filledSize ?? 0);
+        const filledSize = Number.isFinite(apiFilledSize) ? Math.max(0, apiFilledSize) : 0;
+        const avgPrice = Number.isFinite(Number(data?.avgPrice)) ? Number(data.avgPrice) : price;
+        const status = filledSize > 0
+          ? (filledSize < desiredSize ? "partial" : "filled")
+          : "no-fill";
+        if (status === "no-fill") {
+          const noMatchRetryAfter = Date.now() + LIVE_RETRY_BACKOFF_FAK_NO_MATCH_MS;
+          const prevRetry = Number(liveNoMatchRetryByOrderRef.current[retryKey] ?? 0);
+          liveNoMatchRetryByOrderRef.current[retryKey] = Math.max(prevRetry, noMatchRetryAfter);
+        }
+        const entry = recordTrade({
+          outcome,
+          side,
+          price,
+          ratio,
+          momentum,
+          threshold,
+          reason,
+          isHedge,
+          hedgeOf,
+          requestedSize: desiredSize,
+          filledSize,
+          avgPrice,
+          status,
+          mode,
+          orderId,
+          apiAttempted: true
+        });
+        return entry;
+      } catch (err) {
+        return recordTrade({
+          outcome,
+          side,
+          price,
+          ratio,
+          momentum,
+          threshold,
+          reason: `${reason} · ${err?.message ?? "order failed"}`,
+          isHedge,
+          hedgeOf,
+          requestedSize: desiredSize,
+          filledSize: 0,
+          status: "error",
+          mode,
+          apiAttempted: true
+        });
+      } finally {
+        liveOrderBusyRef.current = false;
+      }
     };
 
     const signals = [
@@ -753,209 +1356,222 @@ export default function TrendSizingPage() {
     const rebalanceBypassSpread = lateRebalanceOverride && lateWindowActive;
     const dojiNeutralActive = lateDojiUnwind && lateWindowActive && dojiActive;
 
-    if (dojiNeutralActive) {
-      const upNotional = (avgCostRef.current.Up ?? 0) * (positionsRef.current.Up ?? 0);
-      const downNotional = (avgCostRef.current.Down ?? 0) * (positionsRef.current.Down ?? 0);
-      const unwindSide = upNotional >= downNotional ? "Up" : "Down";
-      const unwindBid = unwindSide === "Up" ? upBid : downBid;
-      const unwindShares = positionsRef.current[unwindSide] ?? 0;
-      const unwindSpreadOk = unwindSide === "Up" ? upSpreadOk : downSpreadOk;
-      const canUnwind = Number.isFinite(unwindBid)
-        && unwindBid > 0
-        && unwindShares > 0
-        && (rebalanceBypassSpread || unwindSpreadOk);
-      const rebalanceKey = "rebalance-doji";
-      if (canUnwind && (rebalanceIgnoreCooldown || shouldTrade(rebalanceKey))) {
-        const baseRebalanceSize = Math.min(maxSize, baseSize * sizeAdjust * maxRebalanceSizeMult);
-        const size = Math.max(0, Math.min(baseRebalanceSize, unwindShares));
-        if (size > 0) {
-          lastTradeRef.current[rebalanceKey] = nowSec;
-          const ratio = unwindSide === "Up" ? upSellRatio : downSellRatio;
-          const momentum = unwindSide === "Up"
-            ? computeMomentum(next.upSell, momentumWindowSec)
-            : computeMomentum(next.downSell, momentumWindowSec);
-          recordTrade({
-            outcome: unwindSide,
-            side: "SELL",
-            price: unwindBid,
-            ratio,
-            momentum,
-            threshold: "doji",
-            reason: "late doji unwind · neutralize inventory"
-          });
-          return;
-        }
-      }
-    }
-
-    const needsRebalance = winnerSide
-      && (winnerFlip
-        || (settlementNow !== null && settlementNow < effectiveSettlementBuffer)
-        || (capNow !== null && netSpentNow > capNow));
-
-    if (needsRebalance && loserSide) {
-      const loserShares = positionsRef.current[loserSide] ?? 0;
-      const winnerAsk = winnerSide === "Up" ? upAsk : downAsk;
-      const loserBid = loserSide === "Up" ? upBid : downBid;
-      const winnerSpreadOk = winnerSide === "Up" ? upSpreadOk : downSpreadOk;
-      const loserSpreadOk = loserSide === "Up" ? upSpreadOk : downSpreadOk;
-      const canBuyWinner = Number.isFinite(winnerAsk)
-        && winnerAsk >= MIN_BUY_PRICE
-        && winnerAsk < MAX_BUY_PRICE
-        && (rebalanceBypassSpread || winnerSpreadOk);
-      const canSellLoser = Number.isFinite(loserBid)
-        && loserBid > 0
-        && loserShares > 0
-        && (rebalanceBypassSpread || loserSpreadOk);
-      let action = null;
-      if (rebalanceMode === "buy-first") {
-        action = canBuyWinner ? "buy" : (canSellLoser ? "sell" : null);
-      } else if (rebalanceMode === "balanced") {
-        if (canBuyWinner && canSellLoser) {
-          const buyGain = Math.max(0, 1 - winnerAsk);
-          const sellGain = Math.max(0, loserBid);
-          action = buyGain >= sellGain ? "buy" : "sell";
-        } else {
-          action = canSellLoser ? "sell" : (canBuyWinner ? "buy" : null);
-        }
-      } else {
-        action = canSellLoser ? "sell" : (canBuyWinner ? "buy" : null);
-      }
-
-      if (action === "buy" && capNow !== null && Number.isFinite(winnerAsk) && effectiveCapMult <= winnerAsk && canSellLoser) {
-        action = "sell";
-      }
-
-      if (action) {
-        const rebalanceKey = `rebalance-${action}-${winnerSide}`;
-        if (rebalanceIgnoreCooldown || winnerFlip || shouldTrade(rebalanceKey)) {
+    const runTrading = async () => {
+      if (dojiNeutralActive) {
+        const upNotional = (avgCostRef.current.Up ?? 0) * (positionsRef.current.Up ?? 0);
+        const downNotional = (avgCostRef.current.Down ?? 0) * (positionsRef.current.Down ?? 0);
+        const unwindSide = upNotional >= downNotional ? "Up" : "Down";
+        const unwindBid = unwindSide === "Up" ? upBid : downBid;
+        const unwindShares = positionsRef.current[unwindSide] ?? 0;
+        const unwindSpreadOk = unwindSide === "Up" ? upSpreadOk : downSpreadOk;
+        const canUnwind = Number.isFinite(unwindBid)
+          && unwindBid > 0
+          && unwindShares > 0
+          && (rebalanceBypassSpread || unwindSpreadOk);
+        const rebalanceKey = "rebalance-doji";
+        if (canUnwind && (rebalanceIgnoreCooldown || shouldTrade(rebalanceKey))) {
           const baseRebalanceSize = Math.min(maxSize, baseSize * sizeAdjust * maxRebalanceSizeMult);
-          const gapBuffer = settlementNow !== null ? Math.max(0, effectiveSettlementBuffer - settlementNow) : 0;
-          const gapCap = capNow !== null ? Math.max(0, netSpentNow - capNow) : 0;
-          if (action === "sell" && canSellLoser) {
-            const perShareGain = Math.max(1e-6, loserBid);
-            const neededShares = (Math.max(gapBuffer, gapCap) / perShareGain) || baseRebalanceSize;
-            const targetSize = Math.min(baseRebalanceSize, neededShares);
-            const size = Math.max(0, Math.min(targetSize, loserShares));
-            if (size > 0) {
+          const size = Math.max(0, Math.min(baseRebalanceSize, unwindShares));
+          if (size > 0) {
+            const ratio = unwindSide === "Up" ? upSellRatio : downSellRatio;
+            const momentum = unwindSide === "Up"
+              ? computeMomentum(next.upSell, momentumWindowSec)
+              : computeMomentum(next.downSell, momentumWindowSec);
+            const entry = await executeTrade({
+              outcome: unwindSide,
+              side: "SELL",
+              price: unwindBid,
+              ratio,
+              momentum,
+              threshold: "doji",
+              reason: "late doji unwind · neutralize inventory",
+              sizeOverride: size
+            });
+            if (entry) {
               lastTradeRef.current[rebalanceKey] = nowSec;
-              const ratio = loserSide === "Up" ? upSellRatio : downSellRatio;
-              const momentum = loserSide === "Up"
-                ? computeMomentum(next.upSell, momentumWindowSec)
-                : computeMomentum(next.downSell, momentumWindowSec);
-              recordTrade({
-                outcome: loserSide,
-                side: "SELL",
-                price: loserBid,
-                ratio,
-                momentum,
-                threshold: "rebalance",
-                reason: `rebalance sell loser · settle ${fmtUsd(settlementNow, 2)} < ${fmtUsd(effectiveSettlementBuffer, 2)} or netSpent ${fmtUsd(netSpentNow, 2)} > cap ${fmtUsd(capNow, 2)}`
-              });
               return;
             }
           }
-          if (action === "buy" && canBuyWinner) {
-            const perShareGain = Math.max(1e-6, 1 - winnerAsk);
-            let neededShares = gapBuffer / perShareGain;
-            if (gapCap > 0 && effectiveCapMult > winnerAsk) {
-              neededShares = Math.max(neededShares, gapCap / Math.max(1e-6, effectiveCapMult - winnerAsk));
+        }
+      }
+
+      const needsRebalance = winnerSide
+        && (winnerFlip
+          || (settlementNow !== null && settlementNow < effectiveSettlementBuffer)
+          || (capNow !== null && netSpentNow > capNow));
+
+      if (needsRebalance && loserSide) {
+        const loserShares = positionsRef.current[loserSide] ?? 0;
+        const winnerAsk = winnerSide === "Up" ? upAsk : downAsk;
+        const loserBid = loserSide === "Up" ? upBid : downBid;
+        const winnerSpreadOk = winnerSide === "Up" ? upSpreadOk : downSpreadOk;
+        const loserSpreadOk = loserSide === "Up" ? upSpreadOk : downSpreadOk;
+        const canBuyWinner = Number.isFinite(winnerAsk)
+          && winnerAsk >= MIN_BUY_PRICE
+          && winnerAsk < MAX_BUY_PRICE
+          && (rebalanceBypassSpread || winnerSpreadOk);
+        const canSellLoser = Number.isFinite(loserBid)
+          && loserBid > 0
+          && loserShares > 0
+          && (rebalanceBypassSpread || loserSpreadOk);
+        let action = null;
+        if (rebalanceMode === "buy-first") {
+          action = canBuyWinner ? "buy" : (canSellLoser ? "sell" : null);
+        } else if (rebalanceMode === "balanced") {
+          if (canBuyWinner && canSellLoser) {
+            const buyGain = Math.max(0, 1 - winnerAsk);
+            const sellGain = Math.max(0, loserBid);
+            action = buyGain >= sellGain ? "buy" : "sell";
+          } else {
+            action = canSellLoser ? "sell" : (canBuyWinner ? "buy" : null);
+          }
+        } else {
+          action = canSellLoser ? "sell" : (canBuyWinner ? "buy" : null);
+        }
+
+        if (action === "buy" && capNow !== null && Number.isFinite(winnerAsk) && effectiveCapMult <= winnerAsk && canSellLoser) {
+          action = "sell";
+        }
+
+        if (action) {
+          const rebalanceKey = `rebalance-${action}-${winnerSide}`;
+          if (rebalanceIgnoreCooldown || winnerFlip || shouldTrade(rebalanceKey)) {
+            const baseRebalanceSize = Math.min(maxSize, baseSize * sizeAdjust * maxRebalanceSizeMult);
+            const gapBuffer = settlementNow !== null ? Math.max(0, effectiveSettlementBuffer - settlementNow) : 0;
+            const gapCap = capNow !== null ? Math.max(0, netSpentNow - capNow) : 0;
+            if (action === "sell" && canSellLoser) {
+              const perShareGain = Math.max(1e-6, loserBid);
+              const neededShares = (Math.max(gapBuffer, gapCap) / perShareGain) || baseRebalanceSize;
+              const targetSize = Math.min(baseRebalanceSize, neededShares);
+              const size = Math.max(0, Math.min(targetSize, loserShares));
+              if (size > 0) {
+                const ratio = loserSide === "Up" ? upSellRatio : downSellRatio;
+                const momentum = loserSide === "Up"
+                  ? computeMomentum(next.upSell, momentumWindowSec)
+                  : computeMomentum(next.downSell, momentumWindowSec);
+                const entry = await executeTrade({
+                  outcome: loserSide,
+                  side: "SELL",
+                  price: loserBid,
+                  ratio,
+                  momentum,
+                  threshold: "rebalance",
+                  reason: `rebalance sell loser · settle ${fmtUsd(settlementNow, 2)} < ${fmtUsd(effectiveSettlementBuffer, 2)} or netSpent ${fmtUsd(netSpentNow, 2)} > cap ${fmtUsd(capNow, 2)}`,
+                  sizeOverride: size
+                });
+                if (entry) {
+                  lastTradeRef.current[rebalanceKey] = nowSec;
+                  return;
+                }
+              }
             }
-            const targetSize = Math.min(baseRebalanceSize, neededShares || baseRebalanceSize);
-            lastTradeRef.current[rebalanceKey] = nowSec;
-            const ratio = winnerSide === "Up" ? upBuyRatio : downBuyRatio;
-            const momentum = winnerSide === "Up"
-              ? computeMomentum(next.upBuy, momentumWindowSec)
-              : computeMomentum(next.downBuy, momentumWindowSec);
-            recordTrade({
-              outcome: winnerSide,
-              side: "BUY",
-              price: winnerAsk,
-              ratio,
-              momentum,
-              threshold: "rebalance",
-              reason: `rebalance buy winner · settle ${fmtUsd(settlementNow, 2)} < ${fmtUsd(effectiveSettlementBuffer, 2)} or netSpent ${fmtUsd(netSpentNow, 2)} > cap ${fmtUsd(capNow, 2)}`
-            });
-            return;
+            if (action === "buy" && canBuyWinner) {
+              const perShareGain = Math.max(1e-6, 1 - winnerAsk);
+              let neededShares = gapBuffer / perShareGain;
+              if (gapCap > 0 && effectiveCapMult > winnerAsk) {
+                neededShares = Math.max(neededShares, gapCap / Math.max(1e-6, effectiveCapMult - winnerAsk));
+              }
+              const targetSize = Math.min(baseRebalanceSize, neededShares || baseRebalanceSize);
+              const ratio = winnerSide === "Up" ? upBuyRatio : downBuyRatio;
+              const momentum = winnerSide === "Up"
+                ? computeMomentum(next.upBuy, momentumWindowSec)
+                : computeMomentum(next.downBuy, momentumWindowSec);
+              const entry = await executeTrade({
+                outcome: winnerSide,
+                side: "BUY",
+                price: winnerAsk,
+                ratio,
+                momentum,
+                threshold: "rebalance",
+                reason: `rebalance buy winner · settle ${fmtUsd(settlementNow, 2)} < ${fmtUsd(effectiveSettlementBuffer, 2)} or netSpent ${fmtUsd(netSpentNow, 2)} > cap ${fmtUsd(capNow, 2)}`,
+                sizeOverride: targetSize
+              });
+              if (entry) {
+                lastTradeRef.current[rebalanceKey] = nowSec;
+                return;
+              }
+            }
           }
         }
       }
-    }
 
-    const outcomeLock = new Set();
-    for (const signal of signals) {
-      if (!signal.enabled) continue;
-      if (!Number.isFinite(signal.price) || !Number.isFinite(signal.ratio)) continue;
-      if (!signal.spreadOk) continue;
-      if (signal.side === "BUY" && dojiActive && !dojiAllowBuys) continue;
-      if (signal.side === "BUY" && (signal.price >= MAX_BUY_PRICE || signal.price < MIN_BUY_PRICE)) continue;
-      if (signal.side === "BUY" && requireFavoredPrimaryBuys && favoredOutcome && signal.outcome !== favoredOutcome) continue;
-      if (signal.side === "SELL" && (positionsRef.current[signal.outcome] ?? 0) <= 0) continue;
-      if (signal.side === "BUY" && inLoserBuyClamp && favoredOutcome && signal.outcome !== favoredOutcome) continue;
-      if (signal.side === "SELL" && inWinnerHold && favoredOutcome && signal.outcome === favoredOutcome) continue;
-      const passesRatio = signal.ratio >= signal.threshold;
-      const favored = signal.outcome === "Up"
-        ? Number.isFinite(upAsk) && Number.isFinite(downAsk) && upAsk >= downAsk
-        : Number.isFinite(upAsk) && Number.isFinite(downAsk) && downAsk >= upAsk;
-      const passesWinnerBuy = signal.side === "BUY"
-        && Number.isFinite(winnerBuyMinPrice)
-        && signal.price >= winnerBuyMinPrice
-        && (!winnerBuyRequireFavored || favored);
-      if (signal.side === "BUY") {
-        if (!passesRatio && !passesWinnerBuy) continue;
-      } else if (!passesRatio) {
-        continue;
+      const outcomeLock = new Set();
+      for (const signal of signals) {
+        if (!signal.enabled) continue;
+        if (!Number.isFinite(signal.price) || !Number.isFinite(signal.ratio)) continue;
+        if (!signal.spreadOk) continue;
+        if (signal.side === "BUY" && dojiActive && !dojiAllowBuys) continue;
+        if (signal.side === "BUY" && (signal.price >= MAX_BUY_PRICE || signal.price < MIN_BUY_PRICE)) continue;
+        if (signal.side === "BUY" && requireFavoredPrimaryBuys && favoredOutcome && signal.outcome !== favoredOutcome) continue;
+        if (signal.side === "SELL" && (positionsRef.current[signal.outcome] ?? 0) <= 0) continue;
+        if (signal.side === "BUY" && inLoserBuyClamp && favoredOutcome && signal.outcome !== favoredOutcome) continue;
+        if (signal.side === "SELL" && inWinnerHold && favoredOutcome && signal.outcome === favoredOutcome) continue;
+        const passesRatio = signal.ratio >= signal.threshold;
+        const favored = signal.outcome === "Up"
+          ? Number.isFinite(upAsk) && Number.isFinite(downAsk) && upAsk >= downAsk
+          : Number.isFinite(upAsk) && Number.isFinite(downAsk) && downAsk >= upAsk;
+        const passesWinnerBuy = signal.side === "BUY"
+          && Number.isFinite(winnerBuyMinPrice)
+          && signal.price >= winnerBuyMinPrice
+          && (!winnerBuyRequireFavored || favored);
+        if (signal.side === "BUY") {
+          if (!passesRatio && !passesWinnerBuy) continue;
+        } else if (!passesRatio) {
+          continue;
+        }
+        if (!Number.isFinite(signal.momentum) || signal.momentum < signal.minMomentum) continue;
+        if (!shouldTrade(signal.key)) continue;
+        if (outcomeLock.has(signal.outcome)) continue;
+        outcomeLock.add(signal.outcome);
+        lastTradeRef.current[signal.key] = nowSec;
+        const reasonParts = [];
+        if (passesRatio) reasonParts.push(`ratio>=${fmtNum(signal.threshold, 2)}`);
+        if (passesWinnerBuy && !passesRatio) reasonParts.push(`favored price>=${fmtNum(winnerBuyMinPrice, 2)}`);
+        reasonParts.push(`mom>=${fmtNum(signal.minMomentum, 4)}`);
+        const entry = await executeTrade({
+          outcome: signal.outcome,
+          side: signal.side,
+          price: signal.price,
+          ratio: signal.ratio,
+          momentum: signal.momentum,
+          threshold: signal.threshold,
+          reason: reasonParts.join(" & ")
+        });
+        if (!entry || entry.isHedge || entry.status === "no-fill" || entry.status === "error") continue;
+        if (!hedgeEnabled || entry.side !== "BUY") continue;
+
+        const hedgeOutcome = entry.outcome === "Up" ? "Down" : "Up";
+        const hedgePrice = hedgeOutcome === "Up" ? upAsk : downAsk;
+        const hedgeRatio = hedgeOutcome === "Up" ? upBuyRatio : downBuyRatio;
+        const hedgeMomentum = hedgeOutcome === "Up"
+          ? computeMomentum(next.upBuy, momentumWindowSec)
+          : computeMomentum(next.downBuy, momentumWindowSec);
+
+        if (!Number.isFinite(hedgePrice) || !Number.isFinite(hedgeRatio)) continue;
+        const hedgeSpreadOk = hedgeOutcome === "Up" ? upSpreadOk : downSpreadOk;
+        if (!hedgeSpreadOk) continue;
+        if (inLoserBuyClamp && favoredOutcome && hedgeOutcome !== favoredOutcome) continue;
+        if (hedgePrice >= MAX_BUY_PRICE || hedgePrice < MIN_BUY_PRICE) continue;
+        if (hedgeRatioMax < hedgeRatioMin) continue;
+        if (hedgeRatio < hedgeRatioMin || hedgeRatio > hedgeRatioMax) continue;
+        if (!Number.isFinite(hedgeSizeMult) || hedgeSizeMult <= 0) continue;
+
+        await executeTrade({
+          outcome: hedgeOutcome,
+          side: "BUY",
+          price: hedgePrice,
+          ratio: hedgeRatio,
+          momentum: hedgeMomentum,
+          threshold: `${fmtNum(hedgeRatioMin, 2)}-${fmtNum(hedgeRatioMax, 2)}`,
+          reason: `hedge ${entry.outcome} BUY · ratio in [${fmtNum(hedgeRatioMin, 2)}, ${fmtNum(hedgeRatioMax, 2)}]`,
+          isHedge: true,
+          hedgeOf: entry.id,
+          sizeOverride: Math.min(maxSize, entry.size * hedgeSizeMult)
+        });
       }
-      if (!Number.isFinite(signal.momentum) || signal.momentum < signal.minMomentum) continue;
-      if (!shouldTrade(signal.key)) continue;
-      if (outcomeLock.has(signal.outcome)) continue;
-      outcomeLock.add(signal.outcome);
-      lastTradeRef.current[signal.key] = nowSec;
-      const reasonParts = [];
-      if (passesRatio) reasonParts.push(`ratio>=${fmtNum(signal.threshold, 2)}`);
-      if (passesWinnerBuy && !passesRatio) reasonParts.push(`favored price>=${fmtNum(winnerBuyMinPrice, 2)}`);
-      reasonParts.push(`mom>=${fmtNum(signal.minMomentum, 4)}`);
-      const entry = recordTrade({
-        outcome: signal.outcome,
-        side: signal.side,
-        price: signal.price,
-        ratio: signal.ratio,
-        momentum: signal.momentum,
-        threshold: signal.threshold,
-        reason: reasonParts.join(" & ")
-      });
-      if (!entry || entry.isHedge) continue;
-      if (!hedgeEnabled || entry.side !== "BUY") continue;
+    };
 
-      const hedgeOutcome = entry.outcome === "Up" ? "Down" : "Up";
-      const hedgePrice = hedgeOutcome === "Up" ? upAsk : downAsk;
-      const hedgeRatio = hedgeOutcome === "Up" ? upBuyRatio : downBuyRatio;
-      const hedgeMomentum = hedgeOutcome === "Up"
-        ? computeMomentum(next.upBuy, momentumWindowSec)
-        : computeMomentum(next.downBuy, momentumWindowSec);
-
-      if (!Number.isFinite(hedgePrice) || !Number.isFinite(hedgeRatio)) continue;
-      const hedgeSpreadOk = hedgeOutcome === "Up" ? upSpreadOk : downSpreadOk;
-      if (!hedgeSpreadOk) continue;
-      if (inLoserBuyClamp && favoredOutcome && hedgeOutcome !== favoredOutcome) continue;
-      if (hedgePrice >= MAX_BUY_PRICE || hedgePrice < MIN_BUY_PRICE) continue;
-      if (hedgeRatioMax < hedgeRatioMin) continue;
-      if (hedgeRatio < hedgeRatioMin || hedgeRatio > hedgeRatioMax) continue;
-      if (!Number.isFinite(hedgeSizeMult) || hedgeSizeMult <= 0) continue;
-
-      recordTrade({
-        outcome: hedgeOutcome,
-        side: "BUY",
-        price: hedgePrice,
-        ratio: hedgeRatio,
-        momentum: hedgeMomentum,
-        threshold: `${fmtNum(hedgeRatioMin, 2)}-${fmtNum(hedgeRatioMax, 2)}`,
-        reason: `hedge ${entry.outcome} BUY · ratio in [${fmtNum(hedgeRatioMin, 2)}, ${fmtNum(hedgeRatioMax, 2)}]`,
-        isHedge: true,
-        hedgeOf: entry.id,
-        sizeOverride: Math.min(maxSize, entry.size * hedgeSizeMult)
-      });
-    }
+    void runTrading();
   }, [
     upAsk,
     upBid,
@@ -965,7 +1581,8 @@ export default function TrendSizingPage() {
     upSellRatio,
     downBuyRatio,
     downSellRatio,
-    simEnabled,
+    tradeActive,
+    liveAllowed,
     buyRatioMinAdj,
     sellRatioMinAdj,
     minMomentumAdj,
@@ -1005,12 +1622,17 @@ export default function TrendSizingPage() {
     downSpread,
     upSpreadLimit,
     downSpreadLimit,
+    activeTokens?.upTokenId,
+    activeTokens?.downTokenId,
     activeAsset
   ]);
 
   const markers = useMemo(() => {
     const map = { upBuy: [], upSell: [], downBuy: [], downSell: [] };
     for (const trade of trades) {
+      if (!Number.isFinite(trade.size) || trade.size <= 0) continue;
+      if (trade.status === "no-fill" || trade.status === "error") continue;
+      const modeTag = trade.mode === "live" ? "L" : "S";
       const marker = {
         time: trade.time,
         position: trade.side === "BUY" ? "belowBar" : "aboveBar",
@@ -1018,7 +1640,7 @@ export default function TrendSizingPage() {
           ? (trade.side === "BUY" ? "#45ffb2" : "#59d7ff")
           : (trade.side === "BUY" ? "#ffcc66" : "#ff5c7a"),
         shape: trade.side === "BUY" ? "arrowUp" : "arrowDown",
-        text: `${trade.isHedge ? "H " : ""}${trade.outcome} ${trade.side} ${fmtNum(trade.size, 0)}`
+        text: `${modeTag}${trade.isHedge ? " H" : ""} ${trade.outcome} ${trade.side} ${fmtNum(trade.size, 0)}`
       };
       if (trade.outcome === "Up" && trade.side === "BUY") map.upBuy.push(marker);
       if (trade.outcome === "Up" && trade.side === "SELL") map.upSell.push(marker);
@@ -1042,7 +1664,58 @@ export default function TrendSizingPage() {
     setCashFlow({ spent: 0, received: 0 });
     setTimeLeftSec(null);
     lastTradeRef.current = {};
+    liveRetryAfterRef.current = 0;
+    liveNoMatchRetryByOrderRef.current = {};
     lastWinnerSideRef.current = null;
+  };
+
+  const stopTrading = () => {
+    setTradeActive(false);
+    setTradeArmed(false);
+    setTradeNotice("Trading stopped.");
+    if (tradeStartTimerRef.current) clearTimeout(tradeStartTimerRef.current);
+    tradeStartTimerRef.current = null;
+  };
+
+  const startTrading = () => {
+    const now = Date.now();
+    const startMs = meta?.polymarket?.marketStartTime ? new Date(meta.polymarket.marketStartTime).getTime() : null;
+    const endMs = meta?.polymarket?.marketEndTime ? new Date(meta.polymarket.marketEndTime).getTime() : null;
+    if (tradeStartTimerRef.current) clearTimeout(tradeStartTimerRef.current);
+    tradeStartTimerRef.current = null;
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      setTradeActive(false);
+      setTradeArmed(true);
+      setTradeNotice("Queued for next window.");
+      return;
+    }
+    if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+      if (now < startMs) {
+        setTradeActive(false);
+        setTradeArmed(true);
+        const label = new Date(startMs).toLocaleTimeString();
+        setTradeNotice(`Queued for ${label}.`);
+        tradeStartTimerRef.current = setTimeout(() => {
+          setTradeActive(true);
+          setTradeArmed(false);
+          setTradeNotice(null);
+        }, Math.max(0, startMs - now));
+        return;
+      }
+      if (now >= startMs && now <= endMs) {
+        setTradeActive(false);
+        setTradeArmed(true);
+        setTradeNotice("Queued for next window.");
+        return;
+      }
+      setTradeActive(false);
+      setTradeArmed(true);
+      setTradeNotice("Queued for next window.");
+      return;
+    }
+    setTradeActive(true);
+    setTradeArmed(false);
+    setTradeNotice(null);
   };
 
   const calcSizePreview = (ratio, threshold, side, outcome) => {
@@ -1052,11 +1725,16 @@ export default function TrendSizingPage() {
       ? (dojiActive ? (dojiAllowBuys ? dojiSizeMult : 0) : 1)
       : 1;
     const sized = Math.min(maxSize, baseSize * sizeAdjust * dojiMult * Math.pow(multiplier, sizeScale));
-    if (side === "SELL") {
-      const available = positions[outcome] ?? 0;
-      return Math.max(0, Math.min(sized, available));
-    }
-    return sized;
+    const previewPrice = side === "BUY"
+      ? (outcome === "Up" ? upAsk : downAsk)
+      : (outcome === "Up" ? upBid : downBid);
+    return normalizeTradeSize({
+      rawSize: sized,
+      side,
+      price: previewPrice,
+      maxSize,
+      available: positions[outcome] ?? 0
+    });
   };
 
   const pnl = useMemo(() => {
@@ -1095,17 +1773,66 @@ export default function TrendSizingPage() {
     };
   }, [positions, avgCost, upBid, downBid, cashFlow]);
 
+  const tradeStats = useMemo(() => {
+    const current = computeTradeStats(trades);
+    const session = {
+      events: current.events,
+      liveEvents: current.liveEvents,
+      apiAttempts: current.apiAttempts,
+      liveApiAttempts: current.liveApiAttempts,
+      filled: current.filled,
+      liveFilled: current.liveFilled,
+      failedApi: current.failedApi,
+      liveFailedApi: current.liveFailedApi,
+      skipped: current.skipped,
+      liveSkipped: current.liveSkipped
+    };
+    for (const entry of windowHistory) {
+      if (entry?.asset && entry.asset !== activeAsset) continue;
+      const s = entry?.tradeStats;
+      if (s && Number.isFinite(s.events)) {
+        session.events += Number(s.events) || 0;
+        session.liveEvents += Number(s.liveEvents) || 0;
+        session.apiAttempts += Number(s.apiAttempts) || 0;
+        session.liveApiAttempts += Number(s.liveApiAttempts) || 0;
+        session.filled += Number(s.filled) || 0;
+        session.liveFilled += Number(s.liveFilled) || 0;
+        session.failedApi += Number(s.failedApi) || 0;
+        session.liveFailedApi += Number(s.liveFailedApi) || 0;
+        session.skipped += Number(s.skipped) || 0;
+        session.liveSkipped += Number(s.liveSkipped) || 0;
+      } else {
+        session.events += Number(entry?.trades) || 0;
+      }
+    }
+    return { current, session };
+  }, [trades, windowHistory, activeAsset]);
+
+  const skippedReasonStats = useMemo(() => {
+    const currentCounts = computeSkippedReasonCounts(trades, { liveOnly: true });
+    let sessionCounts = { ...currentCounts };
+    for (const entry of windowHistory) {
+      if (entry?.asset && entry.asset !== activeAsset) continue;
+      sessionCounts = mergeReasonCounts(sessionCounts, entry?.skippedReasonCounts ?? {});
+    }
+    return {
+      currentRows: reasonCountsToRows(currentCounts),
+      sessionRows: reasonCountsToRows(sessionCounts)
+    };
+  }, [trades, windowHistory, activeAsset]);
+
   return (
     <div className="container">
       <div className="header">
         <div className="brand">
-          <div className="h1">Trend Sizing Simulator</div>
-          <div className="sub">Forward test payout-ratio gating with live CLOB BBO. Simulation only.</div>
+          <div className="h1">Trend Sizing Trader</div>
+          <div className="sub">Automated payout-ratio gating with live CLOB BBO.</div>
         </div>
         <div className="pills">
           <span className="pill">Market: <span className="mono">{activeMarketSlug ?? "-"}</span></span>
           <span className="pill">Meta: <span className="mono">{metaLoading ? "loading" : metaErr ? "error" : "live"}</span></span>
-          <span className="pill">Sim: <span className="mono">{simEnabled ? "running" : "paused"}</span></span>
+          <span className="pill">Trade: <span className="mono">{tradeActive ? (liveAllowed ? "live" : "sim") : tradeArmed ? "armed" : "stopped"}</span></span>
+          <span className="pill">Mode: <span className="mono">{liveAllowed ? "live" : "sim"}</span></span>
         </div>
       </div>
 
@@ -1140,6 +1867,80 @@ export default function TrendSizingPage() {
               {ratioSeries.upBuy.length === 0 ? (
                 <div className="chartEmpty">Waiting for CLOB best bid/ask…</div>
               ) : null}
+            </div>
+            <div className="tradeTableWrap">
+              <div className="cardTitle" style={{ marginBottom: 8 }}>Trade Information</div>
+              <div className="tradeTableScroll">
+                <table className="tradeTable">
+                  <thead>
+                    <tr>
+                      <th>Scope</th>
+                      <th>API Attempts</th>
+                      <th>Filled</th>
+                      <th>Failed API</th>
+                      <th>Skipped</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>Window</td>
+                      <td className="mono">{fmtNum(tradeStats.current.liveApiAttempts, 0)}</td>
+                      <td className="mono">{fmtNum(tradeStats.current.liveFilled, 0)}</td>
+                      <td className="mono">{fmtNum(tradeStats.current.liveFailedApi, 0)}</td>
+                      <td className="mono">{fmtNum(tradeStats.current.liveSkipped, 0)}</td>
+                    </tr>
+                    <tr>
+                      <td>Session</td>
+                      <td className="mono">{fmtNum(tradeStats.session.liveApiAttempts, 0)}</td>
+                      <td className="mono">{fmtNum(tradeStats.session.liveFilled, 0)}</td>
+                      <td className="mono">{fmtNum(tradeStats.session.liveFailedApi, 0)}</td>
+                      <td className="mono">{fmtNum(tradeStats.session.liveSkipped, 0)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div className="tradeControlHint" style={{ marginTop: 8 }}>
+                Last sync: {Number.isFinite(lastSyncTs)
+                  ? new Date(lastSyncTs).toLocaleTimeString(undefined, {
+                    hour: "numeric",
+                    minute: "2-digit",
+                    second: "2-digit",
+                    timeZoneName: "short"
+                  })
+                  : "-"}
+              </div>
+              <div className="tradeInfoReasons">
+                <div className="tradeInfoReasonsBlock">
+                  <div className="tradeInfoReasonsTitle">Window skipped reasons</div>
+                  {skippedReasonStats.currentRows.length ? (
+                    <div className="tradeInfoReasonsList">
+                      {skippedReasonStats.currentRows.map(([reason, count]) => (
+                        <div key={`window-${reason}`} className="tradeInfoReasonRow">
+                          <span>{reason}</span>
+                          <span className="mono">{fmtNum(count, 0)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="tradeHistoryEmpty">No skipped reasons yet.</div>
+                  )}
+                </div>
+                <div className="tradeInfoReasonsBlock">
+                  <div className="tradeInfoReasonsTitle">Session skipped reasons</div>
+                  {skippedReasonStats.sessionRows.length ? (
+                    <div className="tradeInfoReasonsList">
+                      {skippedReasonStats.sessionRows.map(([reason, count]) => (
+                        <div key={`session-${reason}`} className="tradeInfoReasonRow">
+                          <span>{reason}</span>
+                          <span className="mono">{fmtNum(count, 0)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="tradeHistoryEmpty">No skipped reasons yet.</div>
+                  )}
+                </div>
+              </div>
             </div>
             <div className="chartBelowGrid">
               <div className="tradeHistory">
@@ -1257,16 +2058,20 @@ export default function TrendSizingPage() {
                     <span>Received {fmtUsd(cashFlow.received, 2)}</span>
                   </div>
                 </div>
-                <div className="kv">
-                  <div className="k">Trades</div>
-                  <div className="v mono">{fmtNum(trades.length, 0)}</div>
-                </div>
                 <div className="tradeHeaderActions" style={{ marginTop: 10 }}>
-                  <button className="btn" onClick={() => setSimEnabled((v) => !v)}>
-                    {simEnabled ? "Pause Simulation" : "Resume Simulation"}
+                  <button className="btn" onClick={() => (tradeActive || tradeArmed ? stopTrading() : startTrading())}>
+                    {tradeActive || tradeArmed ? "Stop Trading" : "Start Trading"}
                   </button>
                   <button className="btn" onClick={resetSim}>Clear</button>
                 </div>
+                {tradeNotice ? (
+                  <div className="tradeControlHint" style={{ marginTop: 6 }}>{tradeNotice}</div>
+                ) : null}
+                {!liveAllowed ? (
+                  <div className="tradeControlHint" style={{ marginTop: 6 }}>
+                    Live trading disabled (TRADING_ENABLED=true required). Running in sim mode.
+                  </div>
+                ) : null}
               </div>
 
               <div className="tradeHistory windowHistory">
@@ -1301,7 +2106,9 @@ export default function TrendSizingPage() {
                         </div>
                         <div className="tradeHistoryRow">
                           <span>Net Spent: {entry.settlement?.netSpent === null || entry.settlement?.netSpent === undefined ? "-" : fmtUsd(entry.settlement.netSpent, 2)}</span>
-                          <span>Trades: {fmtNum(entry.trades, 0)}</span>
+                          <span>
+                            API {fmtNum(entry.tradeStats?.liveApiAttempts ?? 0, 0)} · Filled {fmtNum(entry.tradeStats?.liveFilled ?? 0, 0)} · Failed {fmtNum(entry.tradeStats?.liveFailedApi ?? 0, 0)} · Skipped {fmtNum(entry.tradeStats?.liveSkipped ?? 0, 0)}
+                          </span>
                         </div>
                         <div className="tradeHistoryRow">
                           <span>Spent: {entry.cashFlow?.spent === null || entry.cashFlow?.spent === undefined ? "-" : fmtUsd(entry.cashFlow.spent, 2)}</span>
@@ -1792,7 +2599,7 @@ export default function TrendSizingPage() {
 
       <section className="card" style={{ marginTop: 18 }}>
         <div className="cardTop">
-          <div className="cardTitle">Simulated Buys & Sells</div>
+          <div className="cardTitle">Trade History</div>
           <div className="tradeHistoryMeta mono">{trades.length} entries</div>
         </div>
         <div className="cardBody">
@@ -1804,22 +2611,31 @@ export default function TrendSizingPage() {
                     <span className="mono">{new Date(trade.ts).toLocaleTimeString()}</span>
                     <span className="tradeHistoryTag">{trade.outcome.toUpperCase()}</span>
                     <span className="tradeHistoryTag">{trade.side}</span>
+                    <span className="tradeHistoryTag">{trade.mode?.toUpperCase?.() ?? "SIM"}</span>
+                    <span className="tradeHistoryTag">{trade.status?.toUpperCase?.() ?? "-"}</span>
                     {trade.isHedge ? <span className="tradeHistoryTag">HEDGE</span> : null}
                   </div>
                   <div className="tradeHistoryRow">
-                    <span>{trade.asset.toUpperCase()} · {fmtNum(trade.size, 0)} sh · {fmtUsd(trade.notional, 2)}</span>
-                    <span>Price {fmtUsd(trade.price, 2)} · Ratio {fmtRatio(trade.ratio, 2)}</span>
+                    <span>
+                      {trade.asset.toUpperCase()} · {fmtNum(trade.size, 0)} sh
+                      {Number.isFinite(trade.requestedSize) ? ` / req ${fmtNum(trade.requestedSize, 0)} sh` : ""}
+                      · {fmtUsd(trade.notional, 2)}
+                    </span>
+                    <span>Avg {fmtUsd(trade.price, 2)} · Ratio {fmtRatio(trade.ratio, 2)}</span>
                   </div>
                   <div className="tradeHistoryRow">
                     <span>Momentum {fmtNum(trade.momentum, 6)}</span>
                     <span>Pos After {fmtNum(trade.positionAfter, 2)} sh</span>
                   </div>
                   <div className="tradeHistoryRow">{trade.reason}</div>
+                  {trade.orderId ? (
+                    <div className="tradeHistoryRow mono">Order ID: {trade.orderId}</div>
+                  ) : null}
                 </div>
               ))}
             </div>
           ) : (
-            <div className="tradeHistoryEmpty">No simulated trades yet.</div>
+            <div className="tradeHistoryEmpty">No trades yet.</div>
           )}
         </div>
       </section>

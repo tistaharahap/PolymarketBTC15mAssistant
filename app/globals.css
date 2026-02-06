@@ -560,6 +560,49 @@ a{color:inherit}
   margin-top: 14px;
 }
 
+.tradeTableScroll{
+  width: 100%;
+  overflow-x: auto;
+}
+
+.tradeInfoReasons{
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.tradeInfoReasonsBlock{
+  border: 1px solid rgba(27,42,68,.7);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(7,8,11,.22);
+}
+
+.tradeInfoReasonsTitle{
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  margin-bottom: 6px;
+}
+
+.tradeInfoReasonsList{
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.tradeInfoReasonRow{
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text);
+}
+
 .ratioLegend{
   display:flex;
   flex-wrap:wrap;

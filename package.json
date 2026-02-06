@@ -5,9 +5,9 @@
   "private": true,
   "scripts": {
     "start": "node src/index.js",
-    "web": "next dev",
+    "web": "node -r ./scripts/preload-timestamps.cjs ./node_modules/next/dist/bin/next dev",
     "web:build": "next build",
-    "web:start": "next start"
+    "web:start": "node -r ./scripts/preload-timestamps.cjs ./node_modules/next/dist/bin/next start"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.2.0",

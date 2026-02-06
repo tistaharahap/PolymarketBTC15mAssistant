@@ -1,11 +1,14 @@
-function fmt(args) {
-  return args.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+import util from "node:util";
+
+function emit(fn, args) {
+  const message = util.format(...args);
+  fn(`[trading] ${message}`);
 }
 
 export const logger = {
-  info: (...args) => console.log("[trading]", fmt(args)),
-  warn: (...args) => console.warn("[trading]", fmt(args)),
-  error: (...args) => console.error("[trading]", fmt(args))
+  info: (...args) => emit(console.log, args),
+  warn: (...args) => emit(console.warn, args),
+  error: (...args) => emit(console.error, args)
 };
 
 export function formatError(err) {

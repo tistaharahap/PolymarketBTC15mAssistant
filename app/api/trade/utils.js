@@ -4,6 +4,7 @@ import { OrderType, Side } from "../../../src/trading/index.js";
 export const NO_STORE_HEADERS = {
   "Cache-Control": "no-store, max-age=0"
 };
+const NUMERIC_EPSILON = 1e-9;
 
 export function jsonResponse(body, status = 200) {
   return Response.json(body, { status, headers: NO_STORE_HEADERS });
@@ -37,6 +38,12 @@ export function parseNumber(value, label, { min = 0, allowZero = false } = {}) {
   if (!Number.isFinite(num)) return { error: `${label} must be a number` };
   if (allowZero ? num < min : num <= min) return { error: `${label} must be > ${min}` };
   return { value: num };
+}
+
+export function isBelowMin(value, min, epsilon = NUMERIC_EPSILON) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || !Number.isFinite(Number(min))) return true;
+  return numeric + epsilon < Number(min);
 }
 
 export function parseBool(value, label) {

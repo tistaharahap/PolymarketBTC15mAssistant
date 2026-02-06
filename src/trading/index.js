@@ -24,6 +24,7 @@ let warnedMissingKey = false;
 
 const normalizeAddress = (value) => String(value).trim();
 const truncate = (value, max = 500) => (value.length > max ? `${value.slice(0, max)}...` : value);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function initClobContext() {
   if (!config.privateKey) {
@@ -282,6 +283,96 @@ export async function fetchOrder(orderId) {
   }
 }
 
+async function fetchTradesForOrder(ctx, order) {
+  if (!order) return [];
+  const tradeIds = Array.isArray(order.associate_trades) ? order.associate_trades : [];
+  if (!tradeIds.length) return [];
+  const trades = [];
+  for (const tradeId of tradeIds) {
+    try {
+      const res = await ctx.client.getTrades({ id: tradeId });
+      if (Array.isArray(res) && res.length) {
+        trades.push(...res);
+      }
+    } catch (err) {
+      logger.warn("Failed to fetch trade %s: %s", tradeId, formatError(err));
+    }
+  }
+  return trades;
+}
+
+function computeFillFromTrades(trades) {
+  let filledSize = 0;
+  let notional = 0;
+  for (const trade of trades) {
+    const size = Number(trade?.size);
+    const price = Number(trade?.price);
+    if (!Number.isFinite(size) || !Number.isFinite(price)) continue;
+    filledSize += size;
+    notional += size * price;
+  }
+  const avgPrice = filledSize > 0 ? notional / filledSize : null;
+  return { filledSize, avgPrice };
+}
+
+export async function fetchOrderFills(orderId, { maxWaitMs = 60000, pollIntervalMs = 1500, preferTrades = false } = {}) {
+  const ctx = await getClobContext();
+  if (!ctx) return null;
+  const started = Date.now();
+  let lastOrder = null;
+  let trades = [];
+
+  while (Date.now() - started <= maxWaitMs) {
+    try {
+      lastOrder = await ctx.client.getOrder(orderId);
+    } catch (err) {
+      logger.warn("Failed to fetch order %s: %s", orderId, formatError(err));
+      lastOrder = null;
+    }
+
+    if (lastOrder?.associate_trades?.length) {
+      trades = await fetchTradesForOrder(ctx, lastOrder);
+      const fills = computeFillFromTrades(trades);
+      if (fills.filledSize > 0 || lastOrder.status !== "live") {
+        return {
+          status: lastOrder.status,
+          filledSize: fills.filledSize,
+          avgPrice: fills.avgPrice,
+          trades,
+          order: lastOrder
+        };
+      }
+    }
+
+    if (lastOrder && lastOrder.status && lastOrder.status !== "live" && !preferTrades) {
+      break;
+    }
+    await sleep(pollIntervalMs);
+  }
+
+  if (!lastOrder) return { status: "unknown", filledSize: 0, avgPrice: null, trades: [] };
+  if (preferTrades) {
+    // Prefer trade-level fills over order fields for market orders.
+    const fills = computeFillFromTrades(trades);
+    return {
+      status: lastOrder.status ?? "unknown",
+      filledSize: fills.filledSize,
+      avgPrice: fills.avgPrice,
+      trades,
+      order: lastOrder
+    };
+  }
+  const sizeMatched = Number(lastOrder.size_matched ?? 0);
+  const avgFallback = Number(lastOrder.price ?? 0);
+  return {
+    status: lastOrder.status ?? "unknown",
+    filledSize: Number.isFinite(sizeMatched) ? sizeMatched : 0,
+    avgPrice: Number.isFinite(avgFallback) && avgFallback > 0 ? avgFallback : null,
+    trades,
+    order: lastOrder
+  };
+}
+
 export async function cancelOrder(orderId) {
   const ctx = await getClobContext();
   if (!ctx) return false;
@@ -309,7 +400,29 @@ export async function fetchCollateralBalance(ctx) {
 
   const balance = Number(res.balance ?? 0);
   const allowance = Number(res.allowance ?? 0);
-  const available = Math.min(Number.isFinite(balance) ? balance : 0, Number.isFinite(allowance) ? allowance : 0);
+  const available = Number.isFinite(balance) ? balance : 0;
+  return { balance, allowance, available };
+}
+
+export async function fetchConditionalBalance(tokenId, ctx) {
+  const clob = ctx ?? (await getClobContext());
+  if (!clob) return null;
+  if (!tokenId) return null;
+
+  let res;
+  try {
+    res = await clob.client.getBalanceAllowance({
+      asset_type: AssetType.CONDITIONAL,
+      token_id: String(tokenId)
+    });
+  } catch (err) {
+    logger.error("Failed to fetch conditional balance token=%s: %s", tokenId, formatError(err));
+    return null;
+  }
+
+  const balance = Number(res.balance ?? 0);
+  const allowance = Number(res.allowance ?? 0);
+  const available = Number.isFinite(balance) ? balance : 0;
   return { balance, allowance, available };
 }
 
@@ -324,3 +437,7 @@ export async function getUserWsAuth(ctx) {
 }
 
 export { Side, OrderType };
+
+if (config.enabled && config.privateKey) {
+  getClobContext().catch(() => {});
+}

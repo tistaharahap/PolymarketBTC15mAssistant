@@ -1,6 +1,7 @@
 import { placeMarketOrder } from "../../../../src/trading/index.js";
 import {
   ensureTradingEnabled,
+  isBelowMin,
   jsonError,
   jsonResponse,
   parseNumber,
@@ -13,6 +14,8 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+const MIN_ORDER_NOTIONAL_USD = 1;
+const MIN_ORDER_SHARES = 5;
 
 export async function POST(req) {
   const guard = ensureTradingEnabled();
@@ -42,6 +45,43 @@ export async function POST(req) {
     const parsed = parseNumber(body.price, "price", { min: 0, allowZero: false });
     if (parsed.error) return jsonError(parsed.error);
     price = parsed.value;
+  }
+
+  if (side.value === "BUY" && isBelowMin(amount.value, MIN_ORDER_NOTIONAL_USD)) {
+    return jsonError(`amount must be >= $${MIN_ORDER_NOTIONAL_USD} for BUY market orders`, 409, {
+      submittedAmount: amount.value
+    });
+  }
+  if (side.value === "BUY") {
+    if (!Number.isFinite(price)) {
+      return jsonError("price is required for BUY market orders to enforce minimum shares", 400);
+    }
+    const requestedShares = amount.value / price;
+    if (isBelowMin(requestedShares, MIN_ORDER_SHARES)) {
+      return jsonError(`order size must be >= ${MIN_ORDER_SHARES} shares`, 409, {
+        submittedAmount: amount.value,
+        price,
+        requestedShares
+      });
+    }
+  }
+  if (side.value === "SELL" && isBelowMin(amount.value, MIN_ORDER_SHARES)) {
+    return jsonError(`order size must be >= ${MIN_ORDER_SHARES} shares`, 409, {
+      submittedAmount: amount.value
+    });
+  }
+  if (side.value === "SELL") {
+    if (!Number.isFinite(price)) {
+      return jsonError("price is required for SELL market orders to enforce notional minimum", 400);
+    }
+    const notional = amount.value * price;
+    if (isBelowMin(notional, MIN_ORDER_NOTIONAL_USD)) {
+      return jsonError(`order notional must be >= $${MIN_ORDER_NOTIONAL_USD}`, 409, {
+        submittedAmount: amount.value,
+        price,
+        notional
+      });
+    }
   }
 
   let tickSize = null;
