@@ -400,7 +400,10 @@ export async function fetchCollateralBalance(ctx) {
 
   const balance = Number(res.balance ?? 0);
   const allowance = Number(res.allowance ?? 0);
-  const available = Number.isFinite(balance) ? balance : 0;
+  const available = Math.max(0, Math.min(
+    Number.isFinite(balance) ? balance : 0,
+    Number.isFinite(allowance) ? allowance : 0
+  ));
   return { balance, allowance, available };
 }
 
@@ -422,7 +425,10 @@ export async function fetchConditionalBalance(tokenId, ctx) {
 
   const balance = Number(res.balance ?? 0);
   const allowance = Number(res.allowance ?? 0);
-  const available = Number.isFinite(balance) ? balance : 0;
+  const available = Math.max(0, Math.min(
+    Number.isFinite(balance) ? balance : 0,
+    Number.isFinite(allowance) ? allowance : 0
+  ));
   return { balance, allowance, available };
 }
 
